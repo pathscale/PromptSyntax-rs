@@ -1359,6 +1359,9 @@ fn other_tag_end(source: &str, start: usize) -> Option<usize> {
             |offset| Some(start + 9 + offset + 2),
         );
     }
+    if source[start..].starts_with("<!") {
+        return declaration_end(source, start + 2).or_else(|| source.len().checked_sub(1));
+    }
     let mut cursor = start.checked_add(1)?;
     if source[cursor..].starts_with('/') {
         cursor += 1;
@@ -1368,6 +1371,31 @@ fn other_tag_end(source: &str, start: usize) -> Option<usize> {
         return None;
     }
     find_tag_end(source, cursor + first.len_utf8())
+}
+
+fn declaration_end(source: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut subset_depth = 0usize;
+    for (offset, ch) in source[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote.is_some() {
+            escaped = true;
+            continue;
+        }
+        match (quote, ch) {
+            (Some(active), close) if active == close => quote = None,
+            (None, '\'' | '"') => quote = Some(ch),
+            (None, '[') => subset_depth += 1,
+            (None, ']') => subset_depth = subset_depth.saturating_sub(1),
+            (None, '>') if subset_depth == 0 => return Some(start + offset),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn url_like_end(source: &str, start: usize) -> Option<usize> {
