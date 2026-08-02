@@ -62,6 +62,10 @@ cargo run --bin ps-core-adapter -- \
 The normalized result uses UTF-8 byte offsets and includes the complete segment tree,
 directive AST, source slices, and parser diagnostics.
 
+Pass `--jsonl` after the commit to stream one compact normalized result per line. The first
+line contains implementation metadata. This mode is intended for large generated
+differential corpora and does not retain all result objects in memory.
+
 ## Trace producer
 
 `ps-trace-producer` derives a user-tier Prompt Trace from deterministic execution facts. It

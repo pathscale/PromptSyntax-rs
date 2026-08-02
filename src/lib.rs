@@ -346,6 +346,11 @@ impl Parser {
                 continue;
             }
 
+            if let Some(end) = url_like_end(source, cursor) {
+                cursor = end;
+                continue;
+            }
+
             let tail = &source[cursor..];
             let Some(ch) = tail.chars().next() else {
                 break;
@@ -423,7 +428,7 @@ impl Parser {
                 return None;
             }
         };
-        let hinted_end = island_hint_end(source, start);
+        let hinted_end = island_hint_end(source, start).max(parsed.end);
         if contains_bidi(&source[start..hinted_end]) {
             diagnostics.push(ParseFailure::bidi(start, hinted_end).at(base));
             return None;
@@ -503,8 +508,16 @@ impl Parser {
         base: usize,
         diagnostics: &mut Vec<Diagnostic>,
     ) -> Option<(usize, Directive)> {
-        let parsed = parse_action(source, start).ok()?;
-        let hinted_end = island_hint_end(source, start);
+        let parsed = match parse_action(source, start) {
+            Ok(action) => action,
+            Err(error) => {
+                if self.action_prefix_is_live(source, start) {
+                    diagnostics.push(error.at(base));
+                }
+                return None;
+            }
+        };
+        let hinted_end = island_hint_end(source, start).max(parsed.end);
         if contains_bidi(&source[start..hinted_end]) {
             diagnostics.push(ParseFailure::bidi(start, hinted_end).at(base));
             return None;
@@ -513,6 +526,15 @@ impl Parser {
             return None;
         }
         Some((parsed.end, Directive::Action(parsed.value)))
+    }
+
+    fn action_prefix_is_live(&self, source: &str, start: usize) -> bool {
+        let Some(sigil) = source[start..].chars().next() else {
+            return false;
+        };
+        let name_start = start + sigil.len_utf8();
+        parse_name_token(source, name_start)
+            .is_some_and(|(name, _)| self.actions.contains(&normalize(&name)))
     }
 
     fn parse_span(
@@ -1094,6 +1116,18 @@ fn find_tag_end(source: &str, start: usize) -> Option<usize> {
 }
 
 fn other_tag_end(source: &str, start: usize) -> Option<usize> {
+    if source[start..].starts_with("<!--") {
+        return source[start + 4..].find("-->").map_or_else(
+            || source.len().checked_sub(1),
+            |offset| Some(start + 4 + offset + 2),
+        );
+    }
+    if source[start..].starts_with("<![CDATA[") {
+        return source[start + 9..].find("]]>").map_or_else(
+            || source.len().checked_sub(1),
+            |offset| Some(start + 9 + offset + 2),
+        );
+    }
     let mut cursor = start.checked_add(1)?;
     if source[cursor..].starts_with('/') {
         cursor += 1;
@@ -1103,6 +1137,41 @@ fn other_tag_end(source: &str, start: usize) -> Option<usize> {
         return None;
     }
     find_tag_end(source, cursor + first.len_utf8())
+}
+
+fn url_like_end(source: &str, start: usize) -> Option<usize> {
+    if start > 0
+        && source[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| unicode_ident::is_xid_continue(ch) || matches!(ch, '+' | '.' | '-'))
+    {
+        return None;
+    }
+    let mut cursor = start;
+    let first = source[cursor..].chars().next()?;
+    if !first.is_ascii_alphabetic() {
+        return None;
+    }
+    cursor += first.len_utf8();
+    while let Some(ch) = source[cursor..].chars().next() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '+' | '.' | '-') {
+            cursor += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if !source[cursor..].starts_with("://") {
+        return None;
+    }
+    cursor += 3;
+    while let Some(ch) = source[cursor..].chars().next() {
+        if ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'') {
+            break;
+        }
+        cursor += ch.len_utf8();
+    }
+    Some(cursor)
 }
 
 fn find_span_close(source: &str, start: usize) -> Option<usize> {
@@ -1240,6 +1309,15 @@ mod tests {
     }
 
     #[test]
+    fn urls_and_markup_comments_do_not_activate_directive_shaped_text() {
+        let source = "https://example.test/@model:atlas/atlas-4 <!-- > @file:notes.md -->";
+        let parsed = Parser::new().parse(source);
+        assert_eq!(parsed.data_plane(), source);
+        assert_eq!(parsed.directives().count(), 0);
+        assert!(parsed.diagnostics.is_empty());
+    }
+
+    #[test]
     fn parses_full_width_sigils_and_unicode_names() {
         let parsed = Parser::new()
             .action("បកប្រែ")
@@ -1370,6 +1448,24 @@ mod tests {
         assert_eq!(parsed.data_plane(), source);
         assert_eq!(parsed.directives().count(), 0);
         assert_eq!(parsed.diagnostics[0].code, DiagnosticCode::BidiControl);
+    }
+
+    #[test]
+    fn bidi_control_in_a_quoted_argument_rejects_the_whole_island() {
+        let source = "@tool:search(query: \"atlas\u{2066}\")";
+        let parsed = Parser::new().parse(source);
+        assert_eq!(parsed.data_plane(), source);
+        assert_eq!(parsed.directives().count(), 0);
+        assert_eq!(parsed.diagnostics[0].code, DiagnosticCode::BidiControl);
+    }
+
+    #[test]
+    fn malformed_declared_action_reports_syntax_invalid() {
+        let source = "/translate(to: \"km\"";
+        let parsed = Parser::new().action("translate").parse(source);
+        assert_eq!(parsed.data_plane(), source);
+        assert_eq!(parsed.directives().count(), 0);
+        assert_eq!(parsed.diagnostics[0].code, DiagnosticCode::SyntaxInvalid);
     }
 
     #[test]
