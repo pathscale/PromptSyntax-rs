@@ -20,8 +20,8 @@ assert_eq!(parsed.directives().count(), 3);
 assert!(matches!(parsed.segments[0], Segment::Directive(_)));
 ```
 
-The initial package intentionally has `publish = false`. Confirm the final registry name
-and code license before the first crates.io release.
+The crate is available from crates.io as [`promptsyntax`](https://crates.io/crates/promptsyntax)
+under the MIT license.
 
 ## Scope
 

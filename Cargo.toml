@@ -3,11 +3,11 @@ name = "promptsyntax"
 version = "0.1.0"
 edition = "2024"
 description = "A provenance-aware parser for Prompt Syntax"
+license = "MIT"
 repository = "https://github.com/pathscale/PromptSyntax-rs"
 readme = "README.md"
 keywords = ["prompt", "parser", "ai", "control-plane"]
 categories = ["parser-implementations"]
-publish = false
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -23,4 +23,3 @@ unsafe_code = "forbid"
 [lints.clippy]
 all = "warn"
 pedantic = "warn"
-
