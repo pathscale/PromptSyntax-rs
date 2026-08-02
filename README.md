@@ -67,6 +67,14 @@ separate layers and intentionally remain host responsibilities.
 See [`docs/agencyzero.md`](docs/agencyzero.md) for the extraction path from AgencyZero's
 current reverse-channel parser.
 
+## C ABI
+
+The workspace's
+[`promptsyntax-capi`](https://github.com/pathscale/PromptSyntax-rs/tree/main/crates/promptsyntax-capi)
+crate exposes this parser through a versioned C ABI using opaque handles and UTF-8 byte
+spans. Unsafe pointer handling is isolated from this crate, which continues to forbid
+unsafe Rust.
+
 ## Development
 
 ```bash
