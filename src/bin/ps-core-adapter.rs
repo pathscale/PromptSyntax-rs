@@ -19,9 +19,12 @@ struct Case {
     source: String,
     #[serde(default)]
     options: Options,
-    data_plane: String,
-    directives: Vec<String>,
-    diagnostics: Vec<String>,
+    #[serde(default)]
+    data_plane: Option<String>,
+    #[serde(default)]
+    directives: Option<Vec<String>>,
+    #[serde(default)]
+    diagnostics: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -44,6 +47,13 @@ struct AdapterResult {
 }
 
 #[derive(Debug, Serialize)]
+struct AdapterHeader {
+    format_version: &'static str,
+    target: &'static str,
+    implementation: Implementation,
+}
+
+#[derive(Clone, Debug, Serialize)]
 struct Implementation {
     id: &'static str,
     version: &'static str,
@@ -69,18 +79,12 @@ struct CoreOutput {
 
 fn main() -> ExitCode {
     match run() {
-        Ok(result) => match serde_json::to_string_pretty(&result) {
-            Ok(output) => {
-                println!("{output}");
-                ExitCode::SUCCESS
-            }
-            Err(error) => fail(&format!("failed to serialize adapter output: {error}")),
-        },
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => fail(&error),
     }
 }
 
-fn run() -> Result<AdapterResult, String> {
+fn run() -> Result<(), String> {
     let mut args = env::args_os();
     let _program = args.next();
     let cases_path = args
@@ -90,6 +94,13 @@ fn run() -> Result<AdapterResult, String> {
         .next()
         .and_then(|value| value.into_string().ok())
         .ok_or_else(|| "usage: ps-core-adapter <core-cases.json> <commit>".to_owned())?;
+    let json_lines = match args.next() {
+        None => false,
+        Some(flag) if flag == "--jsonl" => true,
+        Some(_) => {
+            return Err("usage: ps-core-adapter <core-cases.json> <commit> [--jsonl]".to_owned());
+        }
+    };
     if args.next().is_some() {
         return Err("usage: ps-core-adapter <core-cases.json> <commit>".to_owned());
     }
@@ -101,18 +112,43 @@ fn run() -> Result<AdapterResult, String> {
         .map_err(|error| format!("failed to read {}: {error}", cases_path.to_string_lossy()))?;
     let cases: Vec<Case> = serde_json::from_slice(&input)
         .map_err(|error| format!("failed to parse canonical cases: {error}"))?;
-    let results = cases.into_iter().map(run_case).collect();
-
-    Ok(AdapterResult {
-        format_version: "0.1-draft",
-        target: "core-parser",
-        implementation: Implementation {
-            id: "promptsyntax-rs",
-            version: env!("CARGO_PKG_VERSION"),
-            commit,
-        },
-        results,
-    })
+    let implementation = Implementation {
+        id: "promptsyntax-rs",
+        version: env!("CARGO_PKG_VERSION"),
+        commit,
+    };
+    if json_lines {
+        let header = AdapterHeader {
+            format_version: "0.1-draft",
+            target: "core-parser",
+            implementation,
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&header)
+                .map_err(|error| format!("failed to serialize adapter header: {error}"))?
+        );
+        for case in cases {
+            println!(
+                "{}",
+                serde_json::to_string(&run_case(case))
+                    .map_err(|error| format!("failed to serialize adapter case: {error}"))?
+            );
+        }
+    } else {
+        let result = AdapterResult {
+            format_version: "0.1-draft",
+            target: "core-parser",
+            implementation,
+            results: cases.into_iter().map(run_case).collect(),
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result)
+                .map_err(|error| format!("failed to serialize adapter output: {error}"))?
+        );
+    }
+    Ok(())
 }
 
 fn run_case(case: Case) -> CaseResult {
@@ -144,14 +180,20 @@ fn run_case(case: Case) -> CaseResult {
     if round_trip != case.source {
         adapter_diagnostics.push("CORE_ROUND_TRIP_MISMATCH");
     }
-    if data_plane != case.data_plane {
-        adapter_diagnostics.push("CORE_DATA_PLANE_MISMATCH");
-    }
-    if directive_kinds != case.directives {
-        adapter_diagnostics.push("CORE_DIRECTIVE_SEQUENCE_MISMATCH");
-    }
-    if diagnostic_codes != case.diagnostics {
-        adapter_diagnostics.push("CORE_DIAGNOSTIC_SEQUENCE_MISMATCH");
+    match (&case.data_plane, &case.directives, &case.diagnostics) {
+        (Some(expected_data), Some(expected_directives), Some(expected_diagnostics)) => {
+            if &data_plane != expected_data {
+                adapter_diagnostics.push("CORE_DATA_PLANE_MISMATCH");
+            }
+            if &directive_kinds != expected_directives {
+                adapter_diagnostics.push("CORE_DIRECTIVE_SEQUENCE_MISMATCH");
+            }
+            if &diagnostic_codes != expected_diagnostics {
+                adapter_diagnostics.push("CORE_DIAGNOSTIC_SEQUENCE_MISMATCH");
+            }
+        }
+        (None, None, None) => {}
+        _ => adapter_diagnostics.push("CORE_CASE_EXPECTATION_INCOMPLETE"),
     }
 
     let output = CoreOutput {
