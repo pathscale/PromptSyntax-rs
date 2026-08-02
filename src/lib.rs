@@ -10,6 +10,8 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization as _;
 
+pub mod trace;
+
 /// A half-open byte range in the original UTF-8 source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceSpan {
