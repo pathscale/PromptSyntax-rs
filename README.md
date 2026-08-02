@@ -46,3 +46,18 @@ cargo fmt --all -- --check
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
+
+## Core conformance adapter
+
+`ps-core-adapter` evaluates the specification-owned Core corpus and emits the normalized
+language-neutral result consumed by the PromptSyntax differential runner. The adapter owns
+no expected answers. Supply the canonical corpus path and the exact commit under test:
+
+```bash
+cargo run --bin ps-core-adapter -- \
+  /path/to/promptsyntax.org/conformance/cases/core-parser.json \
+  0123456789abcdef0123456789abcdef01234567
+```
+
+The normalized result uses UTF-8 byte offsets and includes the complete segment tree,
+directive AST, source slices, and parser diagnostics.

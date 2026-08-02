@@ -361,8 +361,17 @@ impl Parser {
                 }
             }
 
-            let parsed = if source[cursor..].starts_with("<ps") && boundary_after_ps(source, cursor)
+            let starts_ps =
+                source[cursor..].starts_with("<ps") && boundary_after_ps(source, cursor);
+            if ch == '<'
+                && !starts_ps
+                && let Some(end) = other_tag_end(source, cursor)
             {
+                cursor = end + 1;
+                continue;
+            }
+
+            let parsed = if starts_ps {
                 self.parse_span(source, cursor, base, diagnostics)
             } else if matches!(ch, '@' | '＠') && boundary_before(source, cursor) {
                 self.parse_reference_or_route(source, cursor, base, diagnostics)
@@ -385,10 +394,7 @@ impl Parser {
                 // A `<ps ...>` header that failed as a whole stays inert as a whole.
                 // Do not resume scanning inside it and accidentally promote one of its
                 // references as an independent point directive.
-                if source[cursor..].starts_with("<ps")
-                    && boundary_after_ps(source, cursor)
-                    && let Some(end) = find_tag_end(source, cursor + 3)
-                {
+                if starts_ps && let Some(end) = find_tag_end(source, cursor + 3) {
                     cursor = end + 1;
                     continue;
                 }
@@ -1083,6 +1089,18 @@ fn find_tag_end(source: &str, start: usize) -> Option<usize> {
         }
     }
     None
+}
+
+fn other_tag_end(source: &str, start: usize) -> Option<usize> {
+    let mut cursor = start.checked_add(1)?;
+    if source[cursor..].starts_with('/') {
+        cursor += 1;
+    }
+    let first = source[cursor..].chars().next()?;
+    if !first.is_alphabetic() && !matches!(first, '!' | '?') {
+        return None;
+    }
+    find_tag_end(source, cursor + first.len_utf8())
 }
 
 fn find_span_close(source: &str, start: usize) -> Option<usize> {
