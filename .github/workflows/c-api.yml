@@ -1,0 +1,80 @@
+name: C API
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "feat/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: c-api-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  workspace:
+    name: Workspace (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust with lint components
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+      - name: Run strict Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build C dynamic and static libraries
+        run: cargo build -p promptsyntax-capi
+
+      - name: Compile and run C client (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror \
+            -I crates/promptsyntax-capi/include \
+            crates/promptsyntax-capi/tests/smoke.c \
+            -L target/debug -lpromptsyntax_capi \
+            -Wl,-rpath,'$ORIGIN/debug' \
+            -o target/capi-smoke
+          ./target/capi-smoke
+
+      - name: Compile and run C and C++ clients (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror \
+            -I crates/promptsyntax-capi/include \
+            crates/promptsyntax-capi/tests/smoke.c \
+            -L target/debug -lpromptsyntax_capi \
+            -Wl,-rpath,@loader_path/debug \
+            -o target/capi-smoke
+          c++ -std=c++17 -Wall -Wextra -Werror \
+            -I crates/promptsyntax-capi/include \
+            crates/promptsyntax-capi/tests/header-smoke.cpp \
+            -L target/debug -lpromptsyntax_capi \
+            -Wl,-rpath,@loader_path/debug \
+            -o target/capi-cpp-smoke
+          ./target/capi-smoke
+          ./target/capi-cpp-smoke

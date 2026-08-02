@@ -12,6 +12,9 @@ use unicode_normalization::UnicodeNormalization as _;
 
 pub mod trace;
 
+/// The version of this parser implementation.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// A half-open byte range in the original UTF-8 source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceSpan {
