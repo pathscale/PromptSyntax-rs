@@ -39,10 +39,24 @@ separate layers and intentionally remain host responsibilities.
 See [`docs/agencyzero.md`](docs/agencyzero.md) for the extraction path from AgencyZero's
 current reverse-channel parser.
 
+## Conformance tooling
+
+The workspace contains an unpublished, stable-Rust `ps-conformance` tool under
+`crates/promptsyntax-conformance`. It validates the specification-owned requirement corpus
+without treating this implementation as the source of expected behavior.
+
+```bash
+cargo run -p promptsyntax-conformance --bin ps-conformance -- \
+  check-requirements /path/to/promptsyntax.org/conformance/requirements.json
+```
+
+The checker is offline and has no Python, Node, provider SDK, or model dependency. The
+canonical corpus remains in the specification repository.
+
 ## Development
 
 ```bash
 cargo fmt --all -- --check
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```

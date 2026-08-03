@@ -9,6 +9,10 @@ readme = "README.md"
 keywords = ["prompt", "parser", "ai", "control-plane"]
 categories = ["parser-implementations"]
 
+[workspace]
+members = ["crates/promptsyntax-conformance"]
+resolver = "3"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 unicode-ident = "1"
