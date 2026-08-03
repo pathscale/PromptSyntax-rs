@@ -1,0 +1,23 @@
+[package]
+name = "promptsyntax-conformance"
+version = "0.0.0"
+edition = "2024"
+description = "Rust conformance corpus checker for PromptSyntax"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "ps-conformance"
+path = "src/main.rs"
+
+[dependencies]
+jsonschema = { version = "0.49", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
