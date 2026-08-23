@@ -171,6 +171,33 @@
     "diagnostics": []
   },
   {
+    "id": "core-prose-angle-comparison",
+    "name": "prose comparison does not hide a later qualified reference",
+    "source": "for a<b the value @model:atlas/atlas-4 matters if x > y end",
+    "options": {},
+    "data_plane": "for a<b the value  matters if x > y end",
+    "directives": ["reference"],
+    "diagnostics": []
+  },
+  {
+    "id": "core-unclosed-comment-diagnostic",
+    "name": "unclosed comment containing directive-shaped text is diagnosed",
+    "source": "Before <!-- malformed --x @model:atlas/atlas-4",
+    "options": {},
+    "data_plane": "Before <!-- malformed --x @model:atlas/atlas-4",
+    "directives": [],
+    "diagnostics": ["SYNTAX_INVALID"]
+  },
+  {
+    "id": "core-generic-scheme-url-inert",
+    "name": "generic scheme URL protects directive-shaped path text",
+    "source": "note://host/@model:atlas/atlas-4 then @file:visible.md",
+    "options": {},
+    "data_plane": "note://host/@model:atlas/atlas-4 then ",
+    "directives": ["reference"],
+    "diagnostics": []
+  },
+  {
     "id": "core-processing-instruction-inert",
     "name": "directive-shaped content in a processing instruction stays inert",
     "source": "<?xml-model href=\"@file:schema.rng\"?>",

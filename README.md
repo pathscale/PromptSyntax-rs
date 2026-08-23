@@ -108,3 +108,21 @@ The producer derives kept, authored fallback, best-effort substitution, and refu
 Contradictory facts, including strict substitution or multiple filled attempts, produce a
 typed JSON error and exit status `1`. The current contract is deliberately limited to the
 `0.1-draft` user-tier executed profile.
+
+Producer inputs use one attempt per authored route step. A venue retry must be collapsed
+into that step's final observed attempt before calling the producer; an extra attempt for
+the same route step is rejected. Filled attempts require both `bound` and an object-valued
+`measured`; failed or blocked attempts require at least one reason. Refusals are attributed
+to the last attempted step.
+
+The current producer emits inline content only. `compiled_request_utf8` and inline boundary
+content must be strictly smaller than `coverage.inline_threshold_bytes`; content at or over
+the threshold must be externalized by a future producer profile and is rejected here.
+Boundary content, measurements, recourse, and fill entries are structurally validated before
+emission. Their schema-extensible members deliberately remain `serde_json::Value`, which is
+why `serde_json` is a public library dependency; callers must still run the resulting trace
+through the canonical Prompt Trace schema as the final compatibility backstop.
+
+Recognition changes are added to `tests/conformance.json`, the language-neutral contract.
+The TypeScript parser must consume the same cases before those changes are considered
+cross-language complete.

@@ -1,0 +1,95 @@
+name: Publish
+
+# Publishing follows the ps-qa contract: bumping Cargo.toml in a normal PR is
+# the whole release ritual. Re-running an already-published version exits green.
+on:
+  push:
+    branches: [master]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
+      - tests/**
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Package and verify, but do not upload'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: crates.io
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Is this version already on crates.io?
+        id: check
+        run: |
+          name=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          echo "name=$name"       >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          published=$(curl -sS -H 'User-Agent: pathscale-ci' \
+            "https://crates.io/api/v1/crates/$name/versions" \
+            | jq -r --arg v "$version" '.versions[]? | select(.num == $v) | .num' || true)
+          if [ -n "$published" ]; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "$name $version is already published; nothing to do"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+            echo "$name $version is new"
+          fi
+
+      - name: Build
+        if: steps.check.outputs.already == 'false'
+        run: cargo build --release
+
+      - name: Test
+        if: steps.check.outputs.already == 'false'
+        run: cargo test --release
+
+      - name: Package
+        if: steps.check.outputs.already == 'false'
+        run: cargo package --locked
+
+      - name: Publish
+        if: steps.check.outputs.already == 'false' && !inputs.dry_run
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "CARGO_REGISTRY_TOKEN is not set on this repository" >&2
+            echo "Add it under Settings -> Secrets -> Actions." >&2
+            exit 1
+          fi
+          cargo publish --locked
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            if [ '${{ steps.check.outputs.already }}' = 'true' ]; then
+              echo "Nothing to publish: \`${{ steps.check.outputs.name }}\` \
+          ${{ steps.check.outputs.version }} is already on crates.io."
+              echo
+              echo 'Bump `version` in Cargo.toml to cut a new one.'
+            elif [ '${{ inputs.dry_run }}' = 'true' ]; then
+              echo "Dry run: packaged \`${{ steps.check.outputs.name }}\` \
+          ${{ steps.check.outputs.version }} without uploading."
+            else
+              echo "Published \`${{ steps.check.outputs.name }}\` \
+          ${{ steps.check.outputs.version }}."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
