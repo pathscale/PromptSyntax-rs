@@ -191,6 +191,155 @@ pub struct ParsedPrompt {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// One incremental projection of an authored text stream.
+///
+/// `data_plane` is safe to render immediately. Complete standalone authoring
+/// segments are withheld from it and returned through `directives`; malformed
+/// declared segments fail closed and are reported through `diagnostics`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct StreamOutput {
+    pub data_plane: String,
+    pub directives: Vec<DirectiveSegment>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+impl StreamOutput {
+    fn append(&mut self, mut other: Self) {
+        self.data_plane.push_str(&other.data_plane);
+        self.directives.append(&mut other.directives);
+        self.diagnostics.append(&mut other.diagnostics);
+    }
+}
+
+/// Incrementally separates a host-declared, standalone authoring surface from
+/// renderable text without depending on provider chunk boundaries.
+///
+/// Providers may split a directive at any UTF-8 chunk boundary, including the
+/// final `>`. This decoder holds only a line that can still become a declared
+/// `<ps @namespace:...>` segment. Ordinary text continues streaming. Markdown
+/// blockquotes, indented code, and fenced code remain inert.
+#[derive(Debug, Clone)]
+pub struct AuthoringStream {
+    parser: Parser,
+    line: String,
+    emitted: usize,
+    offset: usize,
+    fence: Option<(char, usize)>,
+}
+
+impl AuthoringStream {
+    /// Consume one provider text chunk.
+    #[must_use]
+    pub fn push(&mut self, chunk: &str) -> StreamOutput {
+        self.line.push_str(chunk);
+        let mut output = StreamOutput::default();
+
+        while let Some(newline) = self.line.find('\n') {
+            let end = newline + 1;
+            let complete = self.line[..end].to_string();
+            output.append(self.complete_line(&complete, true));
+            self.line.drain(..end);
+            self.offset += end;
+            self.emitted = 0;
+        }
+
+        if !self.could_be_authoring_control() {
+            output
+                .data_plane
+                .push_str(&self.line[self.emitted.min(self.line.len())..]);
+            self.emitted = self.line.len();
+        }
+
+        output
+    }
+
+    /// Resolve the final line when the provider stream ends without a newline.
+    #[must_use]
+    pub fn finish(&mut self) -> StreamOutput {
+        if self.line.is_empty() {
+            return StreamOutput::default();
+        }
+        let complete = std::mem::take(&mut self.line);
+        let output = self.complete_line(&complete, false);
+        self.offset += complete.len();
+        self.emitted = 0;
+        output
+    }
+
+    fn complete_line(&mut self, line: &str, has_newline: bool) -> StreamOutput {
+        let content = line.trim_end_matches(['\r', '\n']);
+        let trimmed = content.trim();
+        let leading = content.len() - content.trim_start().len();
+        let mut output = StreamOutput::default();
+
+        let inert = content.starts_with("    ")
+            || content.starts_with('\t')
+            || trimmed.starts_with('>')
+            || self.update_fence(trimmed)
+            || self.fence.is_some();
+
+        if !inert
+            && let Some((mut directive, mut diagnostics)) =
+                self.parser.standalone_authoring(trimmed)
+        {
+            shift_directive_segment(&mut directive, self.offset + leading);
+            for diagnostic in &mut diagnostics {
+                shift_span(&mut diagnostic.span, self.offset + leading);
+            }
+            output.directives.push(directive);
+            output.diagnostics.append(&mut diagnostics);
+            return output;
+        }
+
+        if !inert && self.parser.looks_declared_authoring_prefix(trimmed) {
+            output.diagnostics.push(Diagnostic {
+                code: DiagnosticCode::SyntaxInvalid,
+                message: "incomplete declared Prompt Syntax authoring segment".into(),
+                span: SourceSpan::new(self.offset + leading, self.offset + content.len()),
+            });
+            return output;
+        }
+
+        output
+            .data_plane
+            .push_str(&line[self.emitted.min(line.len())..]);
+        if !has_newline {
+            self.emitted = line.len();
+        }
+        output
+    }
+
+    fn update_fence(&mut self, trimmed: &str) -> bool {
+        let Some((marker, width, tail)) = markdown_fence_marker(trimmed) else {
+            return false;
+        };
+        match self.fence {
+            None => self.fence = Some((marker, width)),
+            Some((open, minimum))
+                if marker == open && width >= minimum && tail.trim().is_empty() =>
+            {
+                self.fence = None;
+            }
+            Some(_) => {}
+        }
+        true
+    }
+
+    fn could_be_authoring_control(&self) -> bool {
+        if self.fence.is_some() || self.line.starts_with("    ") || self.line.starts_with('\t') {
+            return false;
+        }
+        let trimmed = self.line.trim_start_matches(' ');
+        if self.line.len() - trimmed.len() > 3 || trimmed.starts_with('>') {
+            return false;
+        }
+        if trimmed.is_empty() || "<ps".starts_with(trimmed) {
+            return true;
+        }
+        trimmed.starts_with("<ps") && self.parser.could_name_authoring_namespace(trimmed)
+    }
+}
+
 impl ParsedPrompt {
     /// Reconstruct the original input byte-for-byte.
     #[must_use]
@@ -289,6 +438,19 @@ impl Parser {
         self.authoring_namespaces
             .insert(normalize(namespace.as_ref()));
         self
+    }
+
+    /// Create an incremental decoder for this parser's declared authoring
+    /// namespaces.
+    #[must_use]
+    pub fn authoring_stream(&self) -> AuthoringStream {
+        AuthoringStream {
+            parser: self.clone(),
+            line: String::new(),
+            emitted: 0,
+            offset: 0,
+            fence: None,
+        }
     }
 
     /// Parse content that the caller has already provenance-typed as authored.
@@ -718,6 +880,75 @@ impl Parser {
     fn reference_is_live(&self, reference: &Reference) -> bool {
         reference.namespace.is_some() || self.entities.contains(&reference.lookup_name())
     }
+
+    fn standalone_authoring(&self, source: &str) -> Option<(DirectiveSegment, Vec<Diagnostic>)> {
+        let parsed = self.parse(source);
+        if parsed.segments.len() != 1 {
+            return None;
+        }
+        let Segment::Directive(segment) = parsed.segments.into_iter().next()? else {
+            return None;
+        };
+        matches!(
+            segment.directive,
+            Directive::AuthoringSegment { .. } | Directive::InvalidAuthoringSegment { .. }
+        )
+        .then_some((segment, parsed.diagnostics))
+    }
+
+    fn could_name_authoring_namespace(&self, source: &str) -> bool {
+        let Some(tail) = source.strip_prefix("<ps") else {
+            return false;
+        };
+        let tail = tail.trim_start();
+        let Some(name) = tail.strip_prefix('@').or_else(|| tail.strip_prefix('＠')) else {
+            return tail.is_empty();
+        };
+        let candidate = name
+            .split([':', '(', '>', ' ', '\t'])
+            .next()
+            .unwrap_or(name);
+        candidate.is_empty()
+            || self
+                .authoring_namespaces
+                .iter()
+                .any(|namespace| namespace.starts_with(&normalize(candidate)))
+    }
+
+    fn looks_declared_authoring_prefix(&self, source: &str) -> bool {
+        let Some(tail) = source.strip_prefix("<ps") else {
+            return false;
+        };
+        let tail = tail.trim_start();
+        let Some(name) = tail.strip_prefix('@').or_else(|| tail.strip_prefix('＠')) else {
+            return false;
+        };
+        let candidate = name
+            .split([':', '(', '>', ' ', '\t'])
+            .next()
+            .unwrap_or(name);
+        self.authoring_namespaces
+            .iter()
+            .any(|namespace| namespace.starts_with(&normalize(candidate)))
+    }
+}
+
+fn shift_span(span: &mut SourceSpan, by: usize) {
+    span.start += by;
+    span.end += by;
+}
+
+fn shift_directive_segment(segment: &mut DirectiveSegment, by: usize) {
+    shift_span(&mut segment.span, by);
+}
+
+fn markdown_fence_marker(trimmed: &str) -> Option<(char, usize, &str)> {
+    let marker = trimmed.chars().next()?;
+    if !matches!(marker, '`' | '~') {
+        return None;
+    }
+    let width = trimmed.chars().take_while(|ch| *ch == marker).count();
+    (width >= 3).then(|| (marker, width, &trimmed[width..]))
 }
 
 #[derive(Debug)]
@@ -1555,6 +1786,105 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn incremental_authoring_never_leaks_at_any_chunk_boundary() {
+        let source = r#"<ps @agency:items.add(ref: "t7", title: "Semantic workspace")>"#;
+
+        for split in source
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain([source.len()])
+        {
+            let mut stream = Parser::new()
+                .authoring_namespace("agency")
+                .authoring_stream();
+            let first = stream.push(&source[..split]);
+            let second = stream.push(&source[split..]);
+            let last = stream.finish();
+            assert_eq!(
+                format!(
+                    "{}{}{}",
+                    first.data_plane, second.data_plane, last.data_plane
+                ),
+                "",
+                "directive leaked at UTF-8 split {split}"
+            );
+            assert_eq!(
+                first.directives.len() + second.directives.len() + last.directives.len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_authoring_preserves_prose_and_absolute_spans() {
+        let directive = r#"<ps @agency:items.state(id: "item-a", status: "active")>"#;
+        let source = format!("Working.\n{directive}\nContinuing.");
+        let mut stream = Parser::new()
+            .authoring_namespace("agency")
+            .authoring_stream();
+        let mut output = stream.push(&source);
+        output.append(stream.finish());
+
+        assert_eq!(output.data_plane, "Working.\nContinuing.");
+        assert_eq!(output.directives.len(), 1);
+        assert_eq!(output.directives[0].source, directive);
+        assert_eq!(
+            output.directives[0].span,
+            SourceSpan::new("Working.\n".len(), "Working.\n".len() + directive.len())
+        );
+    }
+
+    #[test]
+    fn incremental_authoring_keeps_quoted_and_code_content_inert() {
+        let directive = r#"<ps @agency:items.state(id: "item-a", status: "active")>"#;
+        let source = format!(
+            "> {directive}\n    {directive}\n```text\n{directive}\n```\nLiteral {directive}"
+        );
+        let mut stream = Parser::new()
+            .authoring_namespace("agency")
+            .authoring_stream();
+        let mut output = StreamOutput::default();
+        for chunk in source.as_bytes().chunks(7) {
+            output.append(stream.push(std::str::from_utf8(chunk).expect("ASCII fixture")));
+        }
+        output.append(stream.finish());
+
+        assert_eq!(output.data_plane, source);
+        assert!(output.directives.is_empty());
+        assert!(output.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn incomplete_declared_authoring_fails_closed() {
+        let source = "<ps @agency:items.add(ref: \"t7\")";
+        let mut stream = Parser::new()
+            .authoring_namespace("agency")
+            .authoring_stream();
+        let first = stream.push(source);
+        let last = stream.finish();
+
+        assert!(first.data_plane.is_empty());
+        assert!(last.data_plane.is_empty());
+        assert_eq!(last.diagnostics.len(), 1);
+        assert_eq!(last.diagnostics[0].code, DiagnosticCode::SyntaxInvalid);
+        assert_eq!(last.diagnostics[0].span, SourceSpan::new(0, source.len()));
+    }
+
+    #[test]
+    fn incomplete_generic_span_stays_visible() {
+        let source = "A literal line follows\n<ps";
+        let mut stream = Parser::new()
+            .authoring_namespace("agency")
+            .authoring_stream();
+        let mut output = stream.push(source);
+        output.append(stream.finish());
+
+        assert_eq!(output.data_plane, source);
+        assert!(output.directives.is_empty());
+        assert!(output.diagnostics.is_empty());
     }
 
     #[test]
