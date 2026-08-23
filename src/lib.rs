@@ -372,9 +372,18 @@ impl Parser {
                 source[cursor..].starts_with("<ps") && boundary_after_ps(source, cursor);
             if ch == '<'
                 && !starts_ps
-                && let Some(end) = other_tag_end(source, cursor)
+                && let Some(region) = other_tag_end(source, cursor)
             {
-                cursor = end + 1;
+                if !region.closed
+                    && self.contains_directive_shaped_text(&source[cursor..=region.end])
+                {
+                    diagnostics.push(Diagnostic {
+                        code: DiagnosticCode::SyntaxInvalid,
+                        message: "unclosed inert markup contains Prompt Syntax-shaped text".into(),
+                        span: SourceSpan::new(base + cursor, base + region.end + 1),
+                    });
+                }
+                cursor = region.end + 1;
                 continue;
             }
 
@@ -410,6 +419,16 @@ impl Parser {
         }
         push_text(source, base, text_start, source.len(), &mut segments);
         segments
+    }
+
+    fn contains_directive_shaped_text(&self, source: &str) -> bool {
+        source.char_indices().any(|(start, ch)| {
+            (matches!(ch, '@' | '＠') && looks_qualified(source, start))
+                || (matches!(ch, '/' | '／') && self.action_prefix_is_live(source, start))
+                || (ch == '<'
+                    && source[start..].starts_with("<ps")
+                    && boundary_after_ps(source, start))
+        })
     }
 
     fn parse_reference_or_route(
@@ -1115,21 +1134,65 @@ fn find_tag_end(source: &str, start: usize) -> Option<usize> {
     None
 }
 
-fn other_tag_end(source: &str, start: usize) -> Option<usize> {
+struct InertRegion {
+    end: usize,
+    closed: bool,
+}
+
+fn other_tag_end(source: &str, start: usize) -> Option<InertRegion> {
+    // In ordinary prose, `a<b` is overwhelmingly a comparison, not the start
+    // of an HTML element. Treating it as markup can hide a later qualified
+    // reference all the way to an unrelated `>`.
+    if start > 0
+        && source[..start]
+            .chars()
+            .next_back()
+            .is_some_and(unicode_ident::is_xid_continue)
+    {
+        return None;
+    }
     if source[start..].starts_with("<!--") {
         return source[start + 4..].find("-->").map_or_else(
-            || source.len().checked_sub(1),
-            |offset| Some(start + 4 + offset + 2),
+            || {
+                source
+                    .len()
+                    .checked_sub(1)
+                    .map(|end| InertRegion { end, closed: false })
+            },
+            |offset| {
+                Some(InertRegion {
+                    end: start + 4 + offset + 2,
+                    closed: true,
+                })
+            },
         );
     }
     if source[start..].starts_with("<![CDATA[") {
         return source[start + 9..].find("]]>").map_or_else(
-            || source.len().checked_sub(1),
-            |offset| Some(start + 9 + offset + 2),
+            || {
+                source
+                    .len()
+                    .checked_sub(1)
+                    .map(|end| InertRegion { end, closed: false })
+            },
+            |offset| {
+                Some(InertRegion {
+                    end: start + 9 + offset + 2,
+                    closed: true,
+                })
+            },
         );
     }
     if source[start..].starts_with("<!") {
-        return declaration_end(source, start + 2).or_else(|| source.len().checked_sub(1));
+        return declaration_end(source, start + 2).map_or_else(
+            || {
+                source
+                    .len()
+                    .checked_sub(1)
+                    .map(|end| InertRegion { end, closed: false })
+            },
+            |end| Some(InertRegion { end, closed: true }),
+        );
     }
     let mut cursor = start.checked_add(1)?;
     if source[cursor..].starts_with('/') {
@@ -1139,7 +1202,7 @@ fn other_tag_end(source: &str, start: usize) -> Option<usize> {
     if !first.is_alphabetic() && !matches!(first, '!' | '?') {
         return None;
     }
-    find_tag_end(source, cursor + first.len_utf8())
+    find_tag_end(source, cursor + first.len_utf8()).map(|end| InertRegion { end, closed: true })
 }
 
 fn declaration_end(source: &str, start: usize) -> Option<usize> {
@@ -1342,6 +1405,40 @@ mod tests {
         let parsed = Parser::new().parse(source);
         assert_eq!(parsed.data_plane(), source);
         assert_eq!(parsed.directives().count(), 0);
+        assert!(parsed.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn prose_angle_comparison_does_not_hide_a_qualified_reference() {
+        let source = "for a<b the value @model:atlas/atlas-4 matters if x > y end";
+        let parsed = Parser::new().parse(source);
+        assert_eq!(
+            parsed.data_plane(),
+            "for a<b the value  matters if x > y end"
+        );
+        assert_eq!(parsed.directives().count(), 1);
+        assert!(parsed.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unclosed_comment_with_directive_shaped_text_is_visible_as_a_diagnostic() {
+        let source = "Before <!-- malformed --x @model:atlas/atlas-4";
+        let parsed = Parser::new().parse(source);
+        assert_eq!(parsed.data_plane(), source);
+        assert_eq!(parsed.directives().count(), 0);
+        assert_eq!(parsed.diagnostics.len(), 1);
+        assert_eq!(parsed.diagnostics[0].code, DiagnosticCode::SyntaxInvalid);
+    }
+
+    #[test]
+    fn generic_scheme_urls_have_the_same_inert_boundary_as_https() {
+        let source = "note://host/@model:atlas/atlas-4 then @file:visible.md";
+        let parsed = Parser::new().parse(source);
+        assert_eq!(
+            parsed.data_plane(),
+            "note://host/@model:atlas/atlas-4 then "
+        );
+        assert_eq!(parsed.directives().count(), 1);
         assert!(parsed.diagnostics.is_empty());
     }
 

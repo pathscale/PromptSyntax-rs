@@ -142,6 +142,7 @@ pub fn produce_trace_json(input: &[u8]) -> Result<Value, TraceProducerError> {
 /// the supplied facts cannot describe one internally consistent execution.
 pub fn produce_trace(input: TraceProducerInput) -> Result<Value, TraceProducerError> {
     validate_envelope(&input)?;
+    let inline_threshold_bytes = input.coverage.inline_threshold_bytes;
     let mut event_ids = HashSet::new();
     let mut events = Vec::with_capacity(input.inferences.len() + input.boundaries.len());
 
@@ -153,7 +154,7 @@ pub fn produce_trace(input: TraceProducerInput) -> Result<Value, TraceProducerEr
                 "producer input repeats an event id",
             ));
         }
-        events.push(produce_inference(inference, index)?);
+        events.push(produce_inference(inference, index, inline_threshold_bytes)?);
     }
     for (index, boundary) in input.boundaries.into_iter().enumerate() {
         if !event_ids.insert(boundary.id.clone()) {
@@ -163,7 +164,7 @@ pub fn produce_trace(input: TraceProducerInput) -> Result<Value, TraceProducerEr
                 "producer input repeats an event id",
             ));
         }
-        events.push(produce_boundary(boundary));
+        events.push(produce_boundary(boundary, index, inline_threshold_bytes)?);
     }
 
     Ok(json!({
@@ -201,6 +202,7 @@ fn validate_envelope(input: &TraceProducerInput) -> Result<(), TraceProducerErro
 fn produce_inference(
     inference: InferenceInput,
     inference_index: usize,
+    inline_threshold_bytes: usize,
 ) -> Result<Value, TraceProducerError> {
     let base = format!("/inferences/{inference_index}/routing");
     if inference.kind != "user-initiated" {
@@ -208,6 +210,13 @@ fn produce_inference(
             "TRACE_PRODUCER_INPUT_UNSUPPORTED",
             format!("/inferences/{inference_index}/kind"),
             "producer supports only user-initiated inferences",
+        ));
+    }
+    if inference.compiled_request_utf8.len() >= inline_threshold_bytes {
+        return Err(producer_error(
+            "TRACE_PRODUCER_CONTENT_TOO_LARGE",
+            format!("/inferences/{inference_index}/compiled_request_utf8"),
+            "compiled request must be externalized at the declared inline threshold",
         ));
     }
     if inference.routing.route.is_empty() || inference.routing.attempts.is_empty() {
@@ -227,6 +236,11 @@ fn produce_inference(
                 "authored route repeats a canonical entity",
             ));
         }
+    }
+
+    validate_attempts(&inference.routing, &base)?;
+    for (index, fill) in inference.routing.non_entity_fill.iter().enumerate() {
+        validate_fill(fill, format!("{base}/non_entity_fill/{index}"))?;
     }
 
     let filled = inference
@@ -327,10 +341,25 @@ fn produce_inference(
                 "routing with no filled attempt requires a refusal fact",
             )
         })?;
+        if !refusal.recourse.is_object() {
+            return Err(producer_error(
+                "TRACE_PRODUCER_REFUSAL_INVALID",
+                format!("{base}/refusal/recourse"),
+                "refusal recourse must be a JSON object",
+            ));
+        }
         let mut resolution_refusal = Map::new();
         resolution_refusal.insert(
             "ref".to_owned(),
-            Value::String(inference.routing.route[0].reference.clone()),
+            Value::String(
+                inference
+                    .routing
+                    .attempts
+                    .last()
+                    .expect("routing attempts were validated as non-empty")
+                    .reference
+                    .clone(),
+            ),
         );
         resolution_refusal.insert("reason".to_owned(), Value::String(refusal.reason.clone()));
         resolution_refusal.insert(
@@ -439,6 +468,97 @@ fn produce_inference(
     }))
 }
 
+fn validate_attempts(routing: &RoutingInput, base: &str) -> Result<(), TraceProducerError> {
+    for (index, attempt) in routing.attempts.iter().enumerate() {
+        let pointer = format!("{base}/attempts/{index}");
+        let Some(route_step) = routing.route.get(index) else {
+            return Err(producer_error(
+                "TRACE_PRODUCER_ATTEMPT_ROUTE_MISMATCH",
+                &pointer,
+                "each route step permits one attempt; retries must be collapsed before input",
+            ));
+        };
+        if attempt.reference != route_step.reference {
+            return Err(producer_error(
+                "TRACE_PRODUCER_ATTEMPT_ROUTE_MISMATCH",
+                format!("{pointer}/ref"),
+                "attempt does not reference its authored route step",
+            ));
+        }
+        match attempt.outcome.as_str() {
+            "filled" => {
+                if attempt.bound.as_deref().is_none_or(str::is_empty) {
+                    return Err(producer_error(
+                        "TRACE_PRODUCER_ATTEMPT_INVALID",
+                        format!("{pointer}/bound"),
+                        "filled attempt requires a bound entity",
+                    ));
+                }
+                validate_measurement(attempt.measured.as_ref(), format!("{pointer}/measured"))?;
+            }
+            "failed" | "blocked" => {
+                if attempt.reasons.as_ref().is_none_or(|reasons| {
+                    reasons.is_empty() || reasons.iter().any(String::is_empty)
+                }) {
+                    return Err(producer_error(
+                        "TRACE_PRODUCER_ATTEMPT_INVALID",
+                        format!("{pointer}/reasons"),
+                        "failed or blocked attempt requires at least one reason",
+                    ));
+                }
+            }
+            _ => {
+                return Err(producer_error(
+                    "TRACE_PRODUCER_ATTEMPT_INVALID",
+                    format!("{pointer}/outcome"),
+                    "attempt outcome must be filled, failed, or blocked",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_measurement(
+    measured: Option<&Value>,
+    pointer: impl Into<String>,
+) -> Result<(), TraceProducerError> {
+    if measured.is_some_and(Value::is_object) {
+        Ok(())
+    } else {
+        Err(producer_error(
+            "TRACE_PRODUCER_ATTEMPT_INVALID",
+            pointer,
+            "measurement must be a JSON object",
+        ))
+    }
+}
+
+fn validate_fill(fill: &Value, pointer: impl Into<String>) -> Result<(), TraceProducerError> {
+    let pointer = pointer.into();
+    let Some(fill) = fill.as_object() else {
+        return Err(producer_error(
+            "TRACE_PRODUCER_FILL_INVALID",
+            &pointer,
+            "fill entry must be a JSON object",
+        ));
+    };
+    for field in ["kind", "status"] {
+        if fill
+            .get(field)
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err(producer_error(
+                "TRACE_PRODUCER_FILL_INVALID",
+                format!("{pointer}/{field}"),
+                format!("fill entry requires a non-empty {field}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_fallback_prefix(
     routing: &RoutingInput,
     route_index: usize,
@@ -472,7 +592,50 @@ fn validate_fallback_prefix(
     Ok(())
 }
 
-fn produce_boundary(boundary: BoundaryInput) -> Value {
+fn produce_boundary(
+    boundary: BoundaryInput,
+    boundary_index: usize,
+    inline_threshold_bytes: usize,
+) -> Result<Value, TraceProducerError> {
+    let base = format!("/boundaries/{boundary_index}");
+    if !matches!(
+        boundary.outcome.as_str(),
+        "succeeded" | "failed" | "blocked"
+    ) {
+        return Err(producer_error(
+            "TRACE_PRODUCER_BOUNDARY_INVALID",
+            format!("{base}/outcome"),
+            "boundary outcome must be succeeded, failed, or blocked",
+        ));
+    }
+    if matches!(boundary.outcome.as_str(), "failed" | "blocked")
+        && boundary.reason.as_deref().is_none_or(str::is_empty)
+    {
+        return Err(producer_error(
+            "TRACE_PRODUCER_BOUNDARY_INVALID",
+            format!("{base}/reason"),
+            "failed or blocked boundary requires a reason",
+        ));
+    }
+    validate_content(
+        &boundary.sent,
+        format!("{base}/sent"),
+        inline_threshold_bytes,
+    )?;
+    if let Some(received) = &boundary.received {
+        validate_content(received, format!("{base}/received"), inline_threshold_bytes)?;
+    }
+    for (index, fill) in boundary.fill.iter().enumerate() {
+        validate_fill(fill, format!("{base}/fill/{index}"))?;
+    }
+    if !boundary.measured.is_object() {
+        return Err(producer_error(
+            "TRACE_PRODUCER_BOUNDARY_INVALID",
+            format!("{base}/measured"),
+            "measurement must be a JSON object",
+        ));
+    }
+
     let mut output = Map::new();
     output.insert("id".to_owned(), Value::String(boundary.id));
     output.insert("event".to_owned(), Value::String("boundary".to_owned()));
@@ -490,7 +653,51 @@ fn produce_boundary(boundary: BoundaryInput) -> Value {
         output.insert("internal".to_owned(), Value::String(internal));
     }
     output.insert("measured".to_owned(), boundary.measured);
-    Value::Object(output)
+    Ok(Value::Object(output))
+}
+
+fn validate_content(
+    content: &Value,
+    pointer: impl Into<String>,
+    inline_threshold_bytes: usize,
+) -> Result<(), TraceProducerError> {
+    let pointer = pointer.into();
+    let Some(content) = content.as_object() else {
+        return Err(producer_error(
+            "TRACE_PRODUCER_CONTENT_INVALID",
+            &pointer,
+            "content must be a JSON object",
+        ));
+    };
+    let Some(state) = content.get("state").and_then(Value::as_str) else {
+        return Err(producer_error(
+            "TRACE_PRODUCER_CONTENT_INVALID",
+            format!("{pointer}/state"),
+            "content requires a string state",
+        ));
+    };
+    if state != "inline" {
+        return Err(producer_error(
+            "TRACE_PRODUCER_CONTENT_INVALID",
+            format!("{pointer}/state"),
+            "the 0.1-draft producer accepts only inline boundary content",
+        ));
+    }
+    let Some(text) = content.get("text").and_then(Value::as_str) else {
+        return Err(producer_error(
+            "TRACE_PRODUCER_CONTENT_INVALID",
+            format!("{pointer}/text"),
+            "inline content requires text",
+        ));
+    };
+    if text.len() >= inline_threshold_bytes {
+        return Err(producer_error(
+            "TRACE_PRODUCER_CONTENT_TOO_LARGE",
+            format!("{pointer}/text"),
+            "content must be externalized at the declared inline threshold",
+        ));
+    }
+    Ok(())
 }
 
 fn insert_optional(output: &mut Map<String, Value>, key: &str, value: Option<&String>) {
@@ -514,6 +721,7 @@ fn producer_error(
 #[cfg(test)]
 mod tests {
     use super::produce_trace_json;
+    use serde_json::Value;
 
     #[test]
     fn derives_kept_without_an_expected_trace() {
@@ -532,5 +740,108 @@ mod tests {
         ))
         .expect_err("strict substitution must fail");
         assert_eq!(error.code, "TRACE_PRODUCER_SUBSTITUTION_NOT_AUTHORIZED");
+    }
+
+    fn kept_input() -> Value {
+        serde_json::from_slice(include_bytes!("../tests/trace-producer/input-kept.json"))
+            .expect("fixture is valid JSON")
+    }
+
+    #[test]
+    fn rejects_a_filled_attempt_without_measurements() {
+        let mut input = kept_input();
+        input["inferences"][0]["routing"]["attempts"][0]["measured"] = Value::Null;
+        let error = produce_trace_json(&serde_json::to_vec(&input).unwrap())
+            .expect_err("filled attempts require measurements");
+        assert_eq!(error.code, "TRACE_PRODUCER_ATTEMPT_INVALID");
+        assert_eq!(error.pointer, "/inferences/0/routing/attempts/0/measured");
+    }
+
+    #[test]
+    fn rejects_inline_content_at_the_externalization_threshold() {
+        let mut input = kept_input();
+        input["inferences"][0]["compiled_request_utf8"] = Value::String("x".repeat(4096));
+        let error = produce_trace_json(&serde_json::to_vec(&input).unwrap())
+            .expect_err("content at the threshold cannot remain inline");
+        assert_eq!(error.code, "TRACE_PRODUCER_CONTENT_TOO_LARGE");
+        assert_eq!(error.pointer, "/inferences/0/compiled_request_utf8");
+    }
+
+    #[test]
+    fn rejects_a_failed_attempt_without_reasons() {
+        let mut input: Value =
+            serde_json::from_slice(include_bytes!("../tests/trace-producer/input-refused.json"))
+                .unwrap();
+        input["inferences"][0]["routing"]["attempts"][0]["reasons"] = Value::Null;
+        let error = produce_trace_json(&serde_json::to_vec(&input).unwrap())
+            .expect_err("failed attempts require reasons");
+        assert_eq!(error.code, "TRACE_PRODUCER_ATTEMPT_INVALID");
+        assert_eq!(error.pointer, "/inferences/0/routing/attempts/0/reasons");
+    }
+
+    #[test]
+    fn rejects_schema_less_boundary_values() {
+        let mut input: Value = serde_json::from_slice(include_bytes!(
+            "../tests/trace-producer/input-boundary-succeeded.json"
+        ))
+        .unwrap();
+        input["boundaries"][0]["sent"] = Value::Null;
+        let error = produce_trace_json(&serde_json::to_vec(&input).unwrap())
+            .expect_err("boundary content must be structured");
+        assert_eq!(error.code, "TRACE_PRODUCER_CONTENT_INVALID");
+        assert_eq!(error.pointer, "/boundaries/0/sent");
+
+        let mut input: Value = serde_json::from_slice(include_bytes!(
+            "../tests/trace-producer/input-boundary-succeeded.json"
+        ))
+        .unwrap();
+        input["boundaries"][0]["measured"] = Value::Null;
+        let error = produce_trace_json(&serde_json::to_vec(&input).unwrap())
+            .expect_err("boundary measurements must be structured");
+        assert_eq!(error.code, "TRACE_PRODUCER_BOUNDARY_INVALID");
+        assert_eq!(error.pointer, "/boundaries/0/measured");
+    }
+
+    #[test]
+    fn rejects_retries_as_extra_route_attempts() {
+        let mut input = kept_input();
+        let first = input["inferences"][0]["routing"]["attempts"][0].clone();
+        input["inferences"][0]["routing"]["attempts"] = Value::Array(vec![
+            serde_json::json!({
+                "ref": "@model:example/atlas-4@2026-08-01!",
+                "outcome": "failed",
+                "reasons": ["TRANSIENT"]
+            }),
+            first,
+        ]);
+        let error = produce_trace_json(&serde_json::to_vec(&input).unwrap())
+            .expect_err("producer input has one attempt per route step");
+        assert_eq!(error.code, "TRACE_PRODUCER_ATTEMPT_ROUTE_MISMATCH");
+        assert_eq!(error.pointer, "/inferences/0/routing/attempts/1");
+    }
+
+    #[test]
+    fn refusal_names_the_last_attempted_route_step() {
+        let mut input: Value = serde_json::from_slice(include_bytes!(
+            "../tests/trace-producer/input-fallback.json"
+        ))
+        .unwrap();
+        input["inferences"][0]["routing"]["attempts"][1] = serde_json::json!({
+            "ref": "@model:example/atlas-mini@2026-08-01",
+            "outcome": "failed",
+            "reasons": ["ENTITY_UNAVAILABLE"]
+        });
+        input["inferences"][0]["routing"]["refusal"] = serde_json::json!({
+            "reason": "FALLBACK_EXHAUSTED",
+            "authority": "venue-operations",
+            "recourse": { "available": true, "kind": "retry" }
+        });
+        let trace = produce_trace_json(&serde_json::to_vec(&input).unwrap()).unwrap();
+        assert_eq!(
+            trace.pointer("/events/0/resolution/refusals/0/ref"),
+            Some(&Value::String(
+                "@model:example/atlas-mini@2026-08-01".to_owned()
+            ))
+        );
     }
 }

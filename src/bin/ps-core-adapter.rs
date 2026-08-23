@@ -10,6 +10,8 @@ use promptsyntax::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+const USAGE: &str = "usage: ps-core-adapter <core-cases.json> <commit> [--jsonl]";
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Case {
@@ -87,22 +89,20 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let mut args = env::args_os();
     let _program = args.next();
-    let cases_path = args
-        .next()
-        .ok_or_else(|| "usage: ps-core-adapter <core-cases.json> <commit>".to_owned())?;
+    let cases_path = args.next().ok_or_else(|| USAGE.to_owned())?;
     let commit = args
         .next()
         .and_then(|value| value.into_string().ok())
-        .ok_or_else(|| "usage: ps-core-adapter <core-cases.json> <commit>".to_owned())?;
+        .ok_or_else(|| USAGE.to_owned())?;
     let json_lines = match args.next() {
         None => false,
         Some(flag) if flag == "--jsonl" => true,
         Some(_) => {
-            return Err("usage: ps-core-adapter <core-cases.json> <commit> [--jsonl]".to_owned());
+            return Err(USAGE.to_owned());
         }
     };
     if args.next().is_some() {
-        return Err("usage: ps-core-adapter <core-cases.json> <commit>".to_owned());
+        return Err(USAGE.to_owned());
     }
     if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("commit must be a 40-character hexadecimal Git object id".to_owned());
@@ -131,7 +131,7 @@ fn run() -> Result<(), String> {
         for case in cases {
             println!(
                 "{}",
-                serde_json::to_string(&run_case(case))
+                serde_json::to_string(&run_case(case)?)
                     .map_err(|error| format!("failed to serialize adapter case: {error}"))?
             );
         }
@@ -140,7 +140,10 @@ fn run() -> Result<(), String> {
             format_version: "0.1-draft",
             target: "core-parser",
             implementation,
-            results: cases.into_iter().map(run_case).collect(),
+            results: cases
+                .into_iter()
+                .map(run_case)
+                .collect::<Result<Vec<_>, _>>()?,
         };
         println!(
             "{}",
@@ -151,7 +154,7 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn run_case(case: Case) -> CaseResult {
+fn run_case(case: Case) -> Result<CaseResult, String> {
     let mut parser = Parser::new();
     for entity in case.options.entities {
         parser = parser.entity(entity);
@@ -164,6 +167,12 @@ fn run_case(case: Case) -> CaseResult {
     }
 
     let parsed = parser.parse(&case.source);
+    for segment in &parsed.segments {
+        validate_segment_spans(segment, &case.source)?;
+    }
+    for diagnostic in &parsed.diagnostics {
+        validate_span(diagnostic.span, &case.source)?;
+    }
     let round_trip = parsed.round_trip();
     let data_plane = parsed.data_plane();
     let directive_kinds = parsed
@@ -226,12 +235,38 @@ fn run_case(case: Case) -> CaseResult {
             .collect(),
     };
 
-    CaseResult {
+    Ok(CaseResult {
         case_id: case.id,
         conformant: adapter_diagnostics.is_empty(),
         diagnostics: adapter_diagnostics,
         output,
+    })
+}
+
+fn validate_segment_spans(segment: &Segment, source: &str) -> Result<(), String> {
+    validate_span(segment.span(), source)?;
+    if let Segment::Directive(directive) = segment
+        && let Directive::Span { segments, .. } = &directive.directive
+    {
+        for nested in segments {
+            validate_segment_spans(nested, source)?;
+        }
     }
+    Ok(())
+}
+
+fn validate_span(span: SourceSpan, source: &str) -> Result<(), String> {
+    source.get(span.start..span.end).map_or_else(
+        || {
+            Err(format!(
+                "parser emitted invalid UTF-8 byte span {}..{} for {} bytes",
+                span.start,
+                span.end,
+                source.len()
+            ))
+        },
+        |_| Ok(()),
+    )
 }
 
 fn segment_json(segment: &Segment, source: &str) -> Value {
@@ -338,9 +373,7 @@ fn span_json(span: SourceSpan, source: &str) -> Value {
     json!({
         "start": span.start,
         "end": span.end,
-        "source": source
-            .get(span.start..span.end)
-            .expect("parser emitted an invalid UTF-8 byte span"),
+        "source": source.get(span.start..span.end).unwrap_or_default(),
     })
 }
 
