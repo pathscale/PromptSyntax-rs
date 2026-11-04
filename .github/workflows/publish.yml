@@ -3,13 +3,6 @@ name: Publish
 # Publishing follows the ps-qa contract: bumping Cargo.toml in a normal PR is
 # the whole release ritual. Re-running an already-published version exits green.
 on:
-  push:
-    branches: [master]
-    paths:
-      - Cargo.toml
-      - Cargo.lock
-      - src/**
-      - tests/**
   workflow_dispatch:
     inputs:
       dry_run:
