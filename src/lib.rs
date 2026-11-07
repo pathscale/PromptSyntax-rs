@@ -332,8 +332,9 @@ impl AuthoringStream {
         if self.fence.is_some() || self.line.starts_with("    ") || self.line.starts_with('\t') {
             return false;
         }
-        let trimmed = self.line.trim_start_matches(' ');
-        if self.line.len() - trimmed.len() > 3 || trimmed.starts_with('>') {
+        let trimmed = self.line.trim_start();
+        let leading_ascii_spaces = self.line.len() - self.line.trim_start_matches(' ').len();
+        if leading_ascii_spaces > 3 || trimmed.starts_with('>') {
             return false;
         }
         if trimmed.is_empty() || "<ps".starts_with(trimmed) {
@@ -2340,6 +2341,82 @@ mod tests {
             output.directives[0].span,
             SourceSpan::new("Working.\n".len(), "Working.\n".len() + directive.len())
         );
+    }
+
+    #[test]
+    fn incremental_authoring_unicode_indentation_matches_complete_line() {
+        let directive = r#"<ps @agency:items.state(id: "item-a", status: "active")>"#;
+        let parser = Parser::new().authoring_namespace("agency");
+        let boundaries = |source: &str| {
+            source
+                .char_indices()
+                .map(|(index, _)| index)
+                .chain([source.len()])
+                .collect::<Vec<_>>()
+        };
+
+        // Each pair creates a synthetic three-chunk partition, including splits
+        // within the multibyte indentation and at the directive's boundaries.
+        for indentation in ["\u{00a0}", "\u{2003}\u{00a0}", " \u{2003}\t\u{00a0}"] {
+            let source = format!("{indentation}{directive}\nProse");
+            let points = boundaries(&source);
+            for &first in &points {
+                for &second in points.iter().filter(|&&point| point >= first) {
+                    let mut stream = parser.authoring_stream();
+                    let mut output = StreamOutput::default();
+                    output.append(stream.push(&source[..first]));
+                    output.append(stream.push(&source[first..second]));
+                    output.append(stream.push(&source[second..]));
+                    output.append(stream.finish());
+
+                    assert_eq!(output.data_plane, "Prose", "partition {first}, {second}");
+                    assert_eq!(output.directives.len(), 1, "partition {first}, {second}");
+                    assert_eq!(output.directives[0].source, directive);
+                    assert_eq!(
+                        output.directives[0].span,
+                        SourceSpan::new(indentation.len(), indentation.len() + directive.len())
+                    );
+                }
+            }
+        }
+
+        // The raw Markdown indentation gates remain inert, while Unicode-indented
+        // prose remains ordinary data and is preserved byte-for-byte.
+        for indentation in ["    ", "\t"] {
+            let source = format!("{indentation}{directive}\n");
+            let points = boundaries(&source);
+            for &first in &points {
+                for &second in points.iter().filter(|&&point| point >= first) {
+                    let mut stream = parser.authoring_stream();
+                    let mut output = StreamOutput::default();
+                    output.append(stream.push(&source[..first]));
+                    output.append(stream.push(&source[first..second]));
+                    output.append(stream.push(&source[second..]));
+                    output.append(stream.finish());
+
+                    assert_eq!(output.data_plane, source, "partition {first}, {second}");
+                    assert!(output.directives.is_empty());
+                    assert!(output.diagnostics.is_empty());
+                }
+            }
+        }
+
+        let prose = "\u{2003}\u{00a0}Plain prose\n";
+        let points = boundaries(prose);
+        for &first in &points {
+            for &second in points.iter().filter(|&&point| point >= first) {
+                let mut stream = parser.authoring_stream();
+                let mut output = StreamOutput::default();
+                output.append(stream.push(&prose[..first]));
+                output.append(stream.push(&prose[first..second]));
+                output.append(stream.push(&prose[second..]));
+                output.append(stream.finish());
+
+                assert_eq!(output.data_plane, prose, "partition {first}, {second}");
+                assert!(output.directives.is_empty());
+                assert!(output.diagnostics.is_empty());
+            }
+        }
     }
 
     #[test]
