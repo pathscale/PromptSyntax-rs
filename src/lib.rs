@@ -540,16 +540,9 @@ impl Parser {
                 break;
             };
 
-            if ch == '\\' {
-                let next = cursor + ch.len_utf8();
-                if source[next..]
-                    .chars()
-                    .next()
-                    .is_some_and(|next| matches!(next, '@' | '/' | '＠' | '／'))
-                {
-                    cursor = next + source[next..].chars().next().map_or(0, char::len_utf8);
-                    continue;
-                }
+            if let Some(end) = escaped_sigil_end(source, cursor) {
+                cursor = end;
+                continue;
             }
 
             let starts_ps =
@@ -573,12 +566,8 @@ impl Parser {
 
             let parsed = if starts_ps {
                 self.parse_span(source, cursor, base, diagnostics, depth, &mut span_lookup)
-            } else if matches!(ch, '@' | '＠') && boundary_before(source, cursor) {
-                self.parse_reference_or_route(source, cursor, base, diagnostics)
-            } else if matches!(ch, '/' | '／') && boundary_before(source, cursor) {
-                self.parse_action(source, cursor, base, diagnostics)
             } else {
-                None
+                self.parse_point_directive(source, cursor, Some((base, diagnostics)))
             };
 
             if let Some((end, directive)) = parsed {
@@ -619,21 +608,24 @@ impl Parser {
         &self,
         source: &str,
         start: usize,
-        base: usize,
-        diagnostics: &mut Vec<Diagnostic>,
+        mut diagnostic_sink: Option<(usize, &mut Vec<Diagnostic>)>,
     ) -> Option<(usize, Directive)> {
         let parsed = match parse_reference(source, start) {
             Ok(reference) => reference,
             Err(error) => {
-                if looks_qualified(source, start) {
-                    diagnostics.push(error.at(base));
+                if let Some((base, diagnostics)) = diagnostic_sink.as_mut()
+                    && looks_qualified(source, start)
+                {
+                    diagnostics.push(error.at(*base));
                 }
                 return None;
             }
         };
         let hinted_end = island_hint_end(source, start).max(parsed.end);
         if contains_bidi(&source[start..hinted_end]) {
-            diagnostics.push(ParseFailure::bidi(start, hinted_end).at(base));
+            if let Some((base, diagnostics)) = diagnostic_sink.as_mut() {
+                diagnostics.push(ParseFailure::bidi(start, hinted_end).at(*base));
+            }
             return None;
         }
         if !self.reference_is_live(&parsed.value) {
@@ -708,27 +700,47 @@ impl Parser {
         &self,
         source: &str,
         start: usize,
-        base: usize,
-        diagnostics: &mut Vec<Diagnostic>,
+        mut diagnostic_sink: Option<(usize, &mut Vec<Diagnostic>)>,
     ) -> Option<(usize, Directive)> {
         let parsed = match parse_action(source, start) {
             Ok(action) => action,
             Err(error) => {
-                if self.action_prefix_is_live(source, start) {
-                    diagnostics.push(error.at(base));
+                if let Some((base, diagnostics)) = diagnostic_sink.as_mut()
+                    && self.action_prefix_is_live(source, start)
+                {
+                    diagnostics.push(error.at(*base));
                 }
                 return None;
             }
         };
         let hinted_end = island_hint_end(source, start).max(parsed.end);
         if contains_bidi(&source[start..hinted_end]) {
-            diagnostics.push(ParseFailure::bidi(start, hinted_end).at(base));
+            if let Some((base, diagnostics)) = diagnostic_sink.as_mut() {
+                diagnostics.push(ParseFailure::bidi(start, hinted_end).at(*base));
+            }
             return None;
         }
         if !self.actions.contains(&normalize(&parsed.value.name)) {
             return None;
         }
         Some((parsed.end, Directive::Action(parsed.value)))
+    }
+
+    fn parse_point_directive(
+        &self,
+        source: &str,
+        start: usize,
+        diagnostic_sink: Option<(usize, &mut Vec<Diagnostic>)>,
+    ) -> Option<(usize, Directive)> {
+        let sigil = source.get(start..)?.chars().next()?;
+        if !boundary_before(source, start) {
+            return None;
+        }
+        match sigil {
+            '@' | '＠' => self.parse_reference_or_route(source, start, diagnostic_sink),
+            '/' | '／' => self.parse_action(source, start, diagnostic_sink),
+            _ => None,
+        }
     }
 
     fn action_prefix_is_live(&self, source: &str, start: usize) -> bool {
@@ -766,7 +778,7 @@ impl Parser {
             return None;
         }
         let body_start = header_end + 1;
-        let Some(close) = span_lookup.close_for(source, body_start) else {
+        let Some(close) = span_lookup.close_for(self, source, body_start) else {
             if line_tail_is_empty(source, body_start) {
                 if let Ok(reference) = parse_reference(header.trim(), 0)
                     && reference.end == header.trim().len()
@@ -1335,36 +1347,110 @@ fn fenced_block_end(source: &str, start: usize) -> Option<usize> {
     if start > 0 && source.as_bytes().get(start.wrapping_sub(1)) != Some(&b'\n') {
         return None;
     }
-    let line_end = source[start..]
+    let (marker, width) = fence_opener(&source[start..])?;
+    let mut cursor = source[start..]
         .find('\n')
         .map_or(source.len(), |at| start + at + 1);
-    let line = source[start..line_end].trim_end_matches(['\r', '\n']);
-    let indent = line.chars().take_while(|ch| *ch == ' ').count();
-    if indent > 3 {
-        return None;
-    }
-    let trimmed = &line[indent..];
-    let marker = trimmed.chars().next()?;
-    if !matches!(marker, '`' | '~') {
-        return None;
-    }
-    let width = trimmed.chars().take_while(|ch| *ch == marker).count();
-    if width < 3 {
-        return None;
-    }
-    let mut cursor = line_end;
     while cursor < source.len() {
         let next = source[cursor..]
             .find('\n')
             .map_or(source.len(), |at| cursor + at + 1);
-        let candidate = source[cursor..next].trim_end_matches(['\r', '\n']).trim();
-        let close_width = candidate.chars().take_while(|ch| *ch == marker).count();
-        if close_width >= width && candidate[close_width..].trim().is_empty() {
+        if fence_closer(&source[cursor..next]).is_some_and(|(close_marker, close_width)| {
+            close_marker == marker && close_width >= width
+        }) {
             return Some(next);
         }
         cursor = next;
     }
     Some(source.len())
+}
+
+fn fence_opener(source: &str) -> Option<(char, usize)> {
+    let indent = source.chars().take(4).take_while(|ch| *ch == ' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let (marker, width, _) = markdown_fence_marker(&source[indent..])?;
+    Some((marker, width))
+}
+
+fn fence_closer(line: &str) -> Option<(char, usize)> {
+    let (marker, width, tail) = markdown_fence_marker(line.trim())?;
+    tail.is_empty().then_some((marker, width))
+}
+
+struct ClosingFenceLine {
+    start: usize,
+    end: usize,
+}
+
+struct ClosingFenceIndex {
+    lines: Vec<ClosingFenceLine>,
+    leaf_count: usize,
+    max_widths: Vec<[usize; 2]>,
+}
+
+impl ClosingFenceIndex {
+    fn new(source: &str) -> Self {
+        let mut lines = Vec::new();
+        let mut widths = Vec::new();
+        let mut start = 0;
+        for line in source.split_inclusive('\n') {
+            let end = start + line.len();
+            if let Some((marker, width)) = fence_closer(line) {
+                lines.push(ClosingFenceLine { start, end });
+                let mut marker_widths = [0; 2];
+                marker_widths[usize::from(marker == '~')] = width;
+                widths.push(marker_widths);
+            }
+            start = end;
+        }
+
+        let leaf_count = lines.len().next_power_of_two();
+        let mut max_widths = vec![[0; 2]; leaf_count * 2];
+        max_widths[leaf_count..leaf_count + widths.len()].copy_from_slice(&widths);
+        for node in (1..leaf_count).rev() {
+            max_widths[node] = std::array::from_fn(|marker| {
+                max_widths[node * 2][marker].max(max_widths[node * 2 + 1][marker])
+            });
+        }
+        Self {
+            lines,
+            leaf_count,
+            max_widths,
+        }
+    }
+
+    fn next_end(&self, body_start: usize, marker: char, width: usize) -> Option<usize> {
+        // A physical line starts after the body byte only if it follows the opener line.
+        let first = self.lines.partition_point(|line| line.start <= body_start);
+        if first == self.lines.len() {
+            return None;
+        }
+
+        let marker = usize::from(marker == '~');
+        let mut node = self.leaf_count + first;
+        if self.max_widths[node][marker] < width {
+            // Visit right siblings in source order until one can hold a match.
+            loop {
+                if node == 1 {
+                    return None;
+                }
+                if node & 1 == 0 && self.max_widths[node + 1][marker] >= width {
+                    node += 1;
+                    break;
+                }
+                node /= 2;
+            }
+        }
+        while node < self.leaf_count {
+            node *= 2;
+            if self.max_widths[node][marker] < width {
+                node += 1;
+            }
+        }
+        Some(self.lines[node - self.leaf_count].end)
+    }
 }
 
 fn find_tag_end(source: &str, start: usize) -> Option<usize> {
@@ -1391,11 +1477,19 @@ fn find_tag_end(source: &str, start: usize) -> Option<usize> {
 
 #[derive(Default)]
 struct SpanLookup {
+    closing_fences: Option<ClosingFenceIndex>,
     tag_ends: HashMap<usize, Option<usize>>,
     closes: HashMap<usize, Option<usize>>,
 }
 
 impl SpanLookup {
+    fn matched_body_fence_end(&mut self, source: &str, body_start: usize) -> Option<usize> {
+        let (marker, width) = fence_opener(&source[body_start..])?;
+        self.closing_fences
+            .get_or_insert_with(|| ClosingFenceIndex::new(source))
+            .next_end(body_start, marker, width)
+    }
+
     fn tag_end(&mut self, source: &str, start: usize) -> Option<usize> {
         if let Some(result) = self.tag_ends.get(&start) {
             return *result;
@@ -1461,7 +1555,7 @@ impl SpanLookup {
         }
     }
 
-    fn close_for(&mut self, source: &str, start: usize) -> Option<usize> {
+    fn close_for(&mut self, parser: &Parser, source: &str, start: usize) -> Option<usize> {
         if let Some(result) = self.closes.get(&start) {
             return *result;
         }
@@ -1469,7 +1563,18 @@ impl SpanLookup {
         let mut pending = vec![start];
         let mut cursor = start;
         while cursor < source.len() {
-            if let Some(end) = fenced_block_end(source, cursor) {
+            let fence_end = if pending.last().copied() == Some(cursor) {
+                self.matched_body_fence_end(source, cursor)
+            } else {
+                fenced_block_end(source, cursor)
+            };
+            if let Some(end) = fence_end {
+                cursor = end;
+                continue;
+            }
+            if let Some(end) =
+                url_like_end(source, cursor).or_else(|| escaped_sigil_end(source, cursor))
+            {
                 cursor = end;
                 continue;
             }
@@ -1481,6 +1586,10 @@ impl SpanLookup {
                     return None;
                 };
                 let body_start = end + 1;
+                if contains_bidi(&source[cursor + 3..end]) {
+                    cursor = body_start;
+                    continue;
+                }
                 pending.push(body_start);
                 cursor = body_start;
                 continue;
@@ -1492,6 +1601,16 @@ impl SpanLookup {
                     return Some(cursor);
                 }
                 cursor += "</ps>".len();
+                continue;
+            }
+            if source[cursor..].starts_with('<')
+                && let Some(inert) = other_tag_end(source, cursor)
+            {
+                cursor = inert.end + 1;
+                continue;
+            }
+            if let Some((end, _)) = parser.parse_point_directive(source, cursor, None) {
+                cursor = end;
                 continue;
             }
             cursor += source[cursor..].chars().next()?.len_utf8();
@@ -1656,6 +1775,15 @@ fn boundary_before(source: &str, start: usize) -> bool {
     !previous.is_ascii_alphanumeric() && !matches!(previous, '_' | '.' | '-' | '\\')
 }
 
+fn escaped_sigil_end(source: &str, cursor: usize) -> Option<usize> {
+    if source.get(cursor..)?.chars().next()? != '\\' {
+        return None;
+    }
+    let sigil_start = cursor + '\\'.len_utf8();
+    let sigil = source.get(sigil_start..)?.chars().next()?;
+    matches!(sigil, '@' | '/' | '＠' | '／').then_some(sigil_start + sigil.len_utf8())
+}
+
 fn keyword(source: &str, start: usize, expected: &str) -> Option<usize> {
     let tail = source.get(start..)?;
     let matched = tail.get(..expected.len())?;
@@ -1723,6 +1851,148 @@ fn text_segment(source: &str, base: usize, start: usize, end: usize) -> Segment 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structural_closers_respect_accepted_islands_and_inert_markup() {
+        for (source, expected) in [
+            (
+                "<ps><!-- </ps> @model:hidden --> @model:live</ps>",
+                "<!-- </ps> @model:hidden --> ",
+            ),
+            (
+                "<ps><![CDATA[</ps> @model:hidden]]> @model:live</ps>",
+                "<![CDATA[</ps> @model:hidden]]> ",
+            ),
+            (
+                "<ps><a title=\"</ps>\">x</a> @model:live</ps>",
+                "<a title=\"</ps>\">x</a> ",
+            ),
+            ("<ps>@tool:find(q: \"</ps>\")ok</ps>!", "ok!"),
+            ("<ps>／search(q: \"</ps>\")ok</ps>!", "ok!"),
+            ("<ps>a<b @model:live</ps>", "a<b "),
+        ] {
+            let parsed = Parser::new().action("search").parse(source);
+            assert_eq!(parsed.round_trip(), source);
+            assert_eq!(parsed.data_plane(), expected, "{source}");
+            assert!(parsed.diagnostics.is_empty(), "{source}");
+            let Segment::Directive(span) = &parsed.segments[0] else {
+                panic!("expected span")
+            };
+            assert_eq!(
+                span.span,
+                SourceSpan::new(0, source.rfind("</ps>").unwrap() + 5)
+            );
+        }
+    }
+
+    #[test]
+    fn structural_matching_preserves_rejected_and_escaped_islands() {
+        for source in [
+            "<ps>/search(q: \"</ps>\")</ps>",
+            "<ps>https://x/@tool:find(q: \"</ps>\")</ps>",
+            "<ps>\\@tool:find(q: \"</ps>\")</ps>",
+            "<ps>\\＠tool:find(q: \"</ps>\")</ps>",
+        ] {
+            let parsed = Parser::new().parse(source);
+            let close = source.find("</ps>").unwrap();
+            assert_eq!(parsed.round_trip(), source);
+            assert_eq!(
+                parsed.data_plane(),
+                format!("{}{}", &source[4..close], &source[close + 5..])
+            );
+            assert!(parsed.diagnostics.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn body_fence_matching_keeps_abandoned_outer_recovery() {
+        let source = "<ps>~~~\n<ps>inner</ps>\n~~~\n";
+        let parsed = Parser::new().parse(source);
+        assert_eq!(parsed.round_trip(), source);
+        assert_eq!(parsed.data_plane(), "<ps>~~~\ninner\n~~~\n");
+        assert_eq!(parsed.diagnostics.len(), 1);
+        assert_eq!(parsed.diagnostics[0].code, DiagnosticCode::UnclosedSpan);
+        let span = parsed
+            .segments
+            .iter()
+            .find_map(|segment| match segment {
+                Segment::Directive(directive) => Some(directive.span),
+                Segment::Text(_) => None,
+            })
+            .unwrap();
+        let start = source.find("<ps>inner").unwrap();
+        assert_eq!(span, SourceSpan::new(start, start + "<ps>inner</ps>".len()));
+
+        let source = "é<ps>~~~\n</ps> @model:hidden\n~~~\n@model:live</ps>!";
+        let parsed = Parser::new().parse(source);
+        assert_eq!(parsed.round_trip(), source);
+        assert_eq!(parsed.data_plane(), "é~~~\n</ps> @model:hidden\n~~~\n!");
+        assert!(parsed.diagnostics.is_empty());
+        assert_eq!(
+            parsed.segments.iter().find_map(|segment| match segment {
+                Segment::Directive(directive) => Some(directive.span),
+                Segment::Text(_) => None,
+            }),
+            Some(SourceSpan::new("é".len(), source.len() - 1))
+        );
+    }
+
+    #[test]
+    fn rejected_nested_header_cannot_establish_a_body_fence() {
+        let source = "<ps><ps \u{202e}>~~~\n</ps> @model:live\n~~~\n</ps></ps>";
+        let parsed = Parser::new().parse(source);
+        assert_eq!(parsed.round_trip(), source);
+        let spans: Vec<_> = parsed
+            .segments
+            .iter()
+            .filter_map(|segment| match segment {
+                Segment::Directive(directive) => Some(directive.span),
+                Segment::Text(_) => None,
+            })
+            .collect();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(
+            spans[0],
+            SourceSpan::new(0, source.find("</ps>").unwrap() + 5)
+        );
+        let reference_start = source.find("@model:live").unwrap();
+        assert_eq!(
+            spans[1],
+            SourceSpan::new(reference_start, reference_start + "@model:live".len())
+        );
+        assert_eq!(parsed.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn closing_fence_index_selects_earliest_sufficient_matching_marker() {
+        let source = "<ps>~~~info\r\ntext\n```\n~~~\n~~~~~\n\u{2003}````\u{2003}\n~~~~tail\n~~~~\n";
+        let index = ClosingFenceIndex::new(source);
+        let short = source.find("\n~~~\n").unwrap() + 1;
+        let wide = source.find("~~~~~").unwrap();
+        let backticks = source.find("\u{2003}````").unwrap();
+        assert_eq!(index.next_end(4, '~', 3), Some(short + 4));
+        assert_eq!(index.next_end(4, '~', 4), Some(wide + 6));
+        assert_eq!(index.next_end(wide, '~', 4), Some(source.len()));
+        assert_eq!(index.next_end(wide, '~', 5), None);
+        assert_eq!(
+            index.next_end(4, '`', 4),
+            Some(backticks + "\u{2003}````\u{2003}\n".len())
+        );
+        assert_eq!(index.next_end(4, '`', 5), None);
+        assert_eq!(index.next_end(source.len(), '~', 3), None);
+    }
+
+    #[test]
+    fn repeated_unmatched_body_fences_share_one_region_index() {
+        let source = "<ps>~~~\n".repeat(1024);
+        let mut lookup = SpanLookup::default();
+        for (start, _) in source.match_indices("~~~") {
+            assert_eq!(lookup.matched_body_fence_end(&source, start), None);
+        }
+        assert!(lookup.closing_fences.as_ref().unwrap().lines.is_empty());
+        assert_eq!(lookup.close_for(&Parser::new(), &source, 4), None);
+        assert_eq!(lookup.closes.len(), 1024);
+    }
 
     #[test]
     fn comment_opener_with_quote_does_not_hide_following_span() {
