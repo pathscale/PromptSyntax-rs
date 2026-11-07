@@ -220,127 +220,359 @@ impl StreamOutput {
 /// Providers may split a directive at any UTF-8 chunk boundary, including the
 /// final `>`. This decoder holds only a line that can still become a declared
 /// `<ps @namespace:...>` segment. Ordinary text continues streaming. Markdown
-/// blockquotes, indented code, and fenced code remain inert.
+/// blockquotes, indented code, and fenced code remain inert. Ambiguous input on
+/// one physical line is retained up to 64 KiB; a longer undecided line is
+/// suppressed with a limit diagnostic at its line boundary.
 #[derive(Debug, Clone)]
 pub struct AuthoringStream {
     parser: Parser,
-    line: String,
-    emitted: usize,
+    pending: String,
     offset: usize,
     fence: Option<(char, usize)>,
+    line_start: usize,
+    line_len: usize,
+    first_non_whitespace: Option<usize>,
+    raw_gate: bool,
+    leading_spaces: usize,
+    tag: TagProbe,
+    probe: Probe,
+    overflow: bool,
+    fence_probe: FenceProbe,
+    line_emitted: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TagProbe {
+    had_space: bool,
+    quote: Option<char>,
+    escaped: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FenceProbe {
+    marker: Option<char>,
+    width: usize,
+    tail: bool,
+    run_done: bool,
+}
+
+const AUTHORING_STREAM_MAX_UNDECIDED_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Probe {
+    Start,
+    P,
+    S,
+    AfterPs,
+    Sigil,
+    Name,
+    Control,
+    Prose,
 }
 
 impl AuthoringStream {
     /// Consume one provider text chunk.
     #[must_use]
     pub fn push(&mut self, chunk: &str) -> StreamOutput {
-        self.line.push_str(chunk);
         let mut output = StreamOutput::default();
-
-        while let Some(newline) = self.line.find('\n') {
-            let end = newline + 1;
-            let complete = self.line[..end].to_string();
-            output.append(self.complete_line(&complete, true));
-            self.line.drain(..end);
-            self.offset += end;
-            self.emitted = 0;
+        for ch in chunk.chars() {
+            if ch == '\n' {
+                output.append(self.finish_line(true));
+            } else {
+                self.observe(ch, &mut output);
+                self.offset += ch.len_utf8();
+            }
         }
-
-        if !self.could_be_authoring_control() {
-            output
-                .data_plane
-                .push_str(&self.line[self.emitted.min(self.line.len())..]);
-            self.emitted = self.line.len();
-        }
-
         output
     }
 
     /// Resolve the final line when the provider stream ends without a newline.
     #[must_use]
     pub fn finish(&mut self) -> StreamOutput {
-        if self.line.is_empty() {
+        if self.line_len == 0 {
             return StreamOutput::default();
         }
-        let complete = std::mem::take(&mut self.line);
-        let output = self.complete_line(&complete, false);
-        self.offset += complete.len();
-        self.emitted = 0;
-        output
+        self.finish_line(false)
     }
 
-    fn complete_line(&mut self, line: &str, has_newline: bool) -> StreamOutput {
-        let content = line.trim_end_matches(['\r', '\n']);
-        let trimmed = content.trim();
-        let leading = content.len() - content.trim_start().len();
-        let mut output = StreamOutput::default();
-
-        let inert = content.starts_with("    ")
-            || content.starts_with('\t')
-            || trimmed.starts_with('>')
-            || self.update_fence(trimmed)
-            || self.fence.is_some();
-
-        if !inert
-            && let Some((mut directive, mut diagnostics)) =
-                self.parser.standalone_authoring(trimmed)
-        {
-            shift_directive_segment(&mut directive, self.offset + leading);
-            for diagnostic in &mut diagnostics {
-                shift_span(&mut diagnostic.span, self.offset + leading);
-            }
-            output.directives.push(directive);
-            output.diagnostics.append(&mut diagnostics);
-            return output;
+    fn observe(&mut self, ch: char, output: &mut StreamOutput) {
+        let width = ch.len_utf8();
+        let relative = self.line_len;
+        self.line_len += width;
+        if ch == '\t' && relative == 0 {
+            self.raw_gate = true;
         }
+        if self.first_non_whitespace.is_none() {
+            if ch == ' ' && relative == self.leading_spaces {
+                self.leading_spaces += 1;
+                if self.leading_spaces >= 4 {
+                    self.raw_gate = true;
+                }
+            }
+            if !ch.is_whitespace() {
+                self.first_non_whitespace = Some(relative);
+                if matches!(ch, '`' | '~') {
+                    self.fence_probe.marker = Some(ch);
+                    self.fence_probe.width = 1;
+                    self.probe = Probe::Prose;
+                } else if ch == '>' {
+                    self.probe = Probe::Prose;
+                }
+            }
+        } else if self.fence_probe.marker.is_some() {
+            if !self.fence_probe.run_done && Some(ch) == self.fence_probe.marker {
+                self.fence_probe.width += 1;
+            } else {
+                self.fence_probe.run_done = true;
+                if !ch.is_whitespace() {
+                    self.fence_probe.tail = true;
+                }
+            }
+        }
+        if self.fence.is_some() {
+            self.probe = Probe::Prose;
+        }
+        if self.raw_gate {
+            self.probe = Probe::Prose;
+        }
+        if self.probe != Probe::Prose && !self.parser.authoring_namespaces.is_empty() {
+            self.advance_probe(ch);
+        } else if self.parser.authoring_namespaces.is_empty() {
+            self.probe = Probe::Prose;
+        }
+        if self.probe == Probe::Prose {
+            if !self.overflow {
+                output.data_plane.push_str(&self.pending);
+                output.data_plane.push(ch);
+                self.line_emitted = true;
+            }
+            self.pending.clear();
+        } else if !self.overflow {
+            if self.pending.len() + width <= AUTHORING_STREAM_MAX_UNDECIDED_BYTES {
+                self.pending.push(ch);
+            } else {
+                self.pending.clear();
+                self.overflow = true;
+            }
+        }
+    }
 
-        if !inert && self.parser.looks_declared_authoring_prefix(trimmed) {
+    fn advance_probe(&mut self, ch: char) {
+        self.probe = match self.probe {
+            Probe::Start => {
+                if ch == '<' {
+                    Probe::P
+                } else if ch.is_whitespace() {
+                    Probe::Start
+                } else {
+                    Probe::Prose
+                }
+            }
+            Probe::P => {
+                if ch == 'p' {
+                    Probe::S
+                } else {
+                    Probe::Prose
+                }
+            }
+            Probe::S => {
+                if ch == 's' {
+                    Probe::AfterPs
+                } else {
+                    Probe::Prose
+                }
+            }
+            Probe::AfterPs => {
+                if ch.is_whitespace() {
+                    self.tag.had_space = true;
+                    Probe::AfterPs
+                } else if matches!(ch, '@' | '＠') {
+                    Probe::Sigil
+                } else {
+                    Probe::Prose
+                }
+            }
+            Probe::Sigil | Probe::Name if ch == ':' => {
+                self.classify_colon();
+                if self.probe == Probe::Prose {
+                    Probe::Prose
+                } else {
+                    Probe::Control
+                }
+            }
+            Probe::Sigil if self.tag.had_space && ch == '>' => {
+                self.observe_tag_quote(ch);
+                self.classify_legacy_delimiter(ch);
+                if self.probe == Probe::Prose {
+                    Probe::Prose
+                } else {
+                    Probe::Control
+                }
+            }
+            Probe::Sigil if !self.tag.had_space && matches!(ch, '(' | '>' | ' ' | '\t') => {
+                self.classify_legacy_delimiter(ch);
+                if self.probe == Probe::Prose {
+                    Probe::Prose
+                } else {
+                    Probe::Name
+                }
+            }
+            Probe::Sigil => {
+                self.observe_tag_quote(ch);
+                Probe::Name
+            }
+            Probe::Name if self.tag.had_space => {
+                let tag_end = self.observe_tag_quote(ch);
+                if tag_end {
+                    self.classify_legacy_delimiter(ch);
+                    if self.probe == Probe::Prose {
+                        Probe::Prose
+                    } else {
+                        Probe::Control
+                    }
+                } else {
+                    Probe::Name
+                }
+            }
+            Probe::Name if matches!(ch, '(' | '>' | ' ' | '\t') => {
+                self.classify_legacy_delimiter(ch);
+                if self.probe == Probe::Prose {
+                    Probe::Prose
+                } else {
+                    Probe::Name
+                }
+            }
+            Probe::Name => Probe::Name,
+            other => other,
+        };
+    }
+
+    fn observe_tag_quote(&mut self, ch: char) -> bool {
+        if self.tag.escaped {
+            self.tag.escaped = false;
+            return false;
+        }
+        if ch == '\\' && self.tag.quote.is_some() {
+            self.tag.escaped = true;
+            return false;
+        }
+        match (self.tag.quote, ch) {
+            (Some(quote), current) if quote == current => self.tag.quote = None,
+            (None, '\'' | '"') => self.tag.quote = Some(ch),
+            (None, '>') => return true,
+            _ => {}
+        }
+        false
+    }
+
+    fn classify_legacy_delimiter(&mut self, delimiter: char) {
+        let candidate = format!("{}{delimiter}", self.pending);
+        if !self.parser.looks_declared_authoring_prefix(&candidate) {
+            self.probe = Probe::Prose;
+        }
+    }
+
+    fn classify_colon(&mut self) {
+        let candidate = format!("{}:", self.pending);
+        let trimmed = candidate.trim();
+        let header = trimmed.strip_prefix("<ps").unwrap_or(trimmed).trim();
+        if !self.parser.looks_declared_authoring_prefix(trimmed)
+            && !self.parser.is_declared_authoring_header(header)
+        {
+            self.probe = Probe::Prose;
+        }
+    }
+
+    fn finish_line(&mut self, has_newline: bool) -> StreamOutput {
+        let mut output = StreamOutput::default();
+        let line_end = self.offset;
+        let candidate_fence =
+            !self.raw_gate && self.fence_probe.marker.is_some() && self.fence_probe.width >= 3;
+        let was_fenced = self.fence.is_some();
+        if candidate_fence {
+            match self.fence {
+                None => {
+                    self.fence = Some((self.fence_probe.marker.unwrap(), self.fence_probe.width));
+                }
+                Some((marker, width))
+                    if Some(marker) == self.fence_probe.marker
+                        && self.fence_probe.width >= width
+                        && !self.fence_probe.tail =>
+                {
+                    self.fence = None;
+                }
+                _ => {}
+            }
+        }
+        if self.overflow {
             output.diagnostics.push(Diagnostic {
                 code: DiagnosticCode::SyntaxInvalid,
-                message: "incomplete declared Prompt Syntax authoring segment".into(),
-                span: SourceSpan::new(self.offset + leading, self.offset + content.len()),
+                message: "authoring stream line exceeds 64 KiB undecided-input limit".into(),
+                span: SourceSpan::new(self.line_start, line_end),
             });
-            return output;
-        }
-
-        output
-            .data_plane
-            .push_str(&line[self.emitted.min(line.len())..]);
-        if !has_newline {
-            self.emitted = line.len();
-        }
-        output
-    }
-
-    fn update_fence(&mut self, trimmed: &str) -> bool {
-        let Some((marker, width, tail)) = markdown_fence_marker(trimmed) else {
-            return false;
-        };
-        match self.fence {
-            None => self.fence = Some((marker, width)),
-            Some((open, minimum))
-                if marker == open && width >= minimum && tail.trim().is_empty() =>
+        } else if self.probe != Probe::Prose && !self.pending.is_empty() {
+            let content = self.pending.trim_end_matches('\r');
+            let trimmed = content.trim();
+            let leading = content.len() - content.trim_start().len();
+            if !was_fenced
+                && !self.raw_gate
+                && let Some((mut directive, mut diagnostics)) =
+                    self.parser.standalone_authoring(trimmed)
             {
-                self.fence = None;
+                shift_directive_segment(&mut directive, self.line_start + leading);
+                for diagnostic in &mut diagnostics {
+                    shift_span(&mut diagnostic.span, self.line_start + leading);
+                }
+                output.directives.push(directive);
+                output.diagnostics.append(&mut diagnostics);
+            } else if !was_fenced
+                && !self.raw_gate
+                && self.parser.looks_declared_authoring_prefix(trimmed)
+            {
+                output.diagnostics.push(Diagnostic {
+                    code: DiagnosticCode::SyntaxInvalid,
+                    message: "incomplete declared Prompt Syntax authoring segment".into(),
+                    span: SourceSpan::new(
+                        self.line_start + leading,
+                        self.line_start + content.len(),
+                    ),
+                });
+            } else {
+                output.data_plane.push_str(&self.pending);
             }
-            Some(_) => {}
         }
-        true
-    }
-
-    fn could_be_authoring_control(&self) -> bool {
-        if self.fence.is_some() || self.line.starts_with("    ") || self.line.starts_with('\t') {
-            return false;
+        if has_newline
+            && (self.line_emitted
+                || (!self.overflow
+                    && output.directives.is_empty()
+                    && output.diagnostics.is_empty()))
+        {
+            output.data_plane.push('\n');
         }
-        let trimmed = self.line.trim_start();
-        let leading_ascii_spaces = self.line.len() - self.line.trim_start_matches(' ').len();
-        if leading_ascii_spaces > 3 || trimmed.starts_with('>') {
-            return false;
+        if has_newline {
+            self.offset += 1;
         }
-        if trimmed.is_empty() || "<ps".starts_with(trimmed) {
-            return true;
-        }
-        trimmed.starts_with("<ps") && self.parser.could_name_authoring_namespace(trimmed)
+        self.line_start = self.offset;
+        self.line_len = 0;
+        self.pending.clear();
+        self.first_non_whitespace = None;
+        self.raw_gate = false;
+        self.leading_spaces = 0;
+        self.tag.had_space = false;
+        self.tag.quote = None;
+        self.tag.escaped = false;
+        self.probe = if self.fence.is_some() {
+            Probe::Prose
+        } else {
+            Probe::Start
+        };
+        self.overflow = false;
+        self.line_emitted = false;
+        self.fence_probe.marker = None;
+        self.fence_probe.width = 0;
+        self.fence_probe.tail = false;
+        self.fence_probe.run_done = false;
+        output
     }
 }
 
@@ -450,10 +682,19 @@ impl Parser {
     pub fn authoring_stream(&self) -> AuthoringStream {
         AuthoringStream {
             parser: self.clone(),
-            line: String::new(),
-            emitted: 0,
+            pending: String::new(),
             offset: 0,
             fence: None,
+            line_start: 0,
+            line_len: 0,
+            first_non_whitespace: None,
+            raw_gate: false,
+            leading_spaces: 0,
+            tag: TagProbe::default(),
+            probe: Probe::Start,
+            overflow: false,
+            fence_probe: FenceProbe::default(),
+            line_emitted: false,
         }
     }
 
@@ -931,25 +1172,6 @@ impl Parser {
             Directive::AuthoringSegment { .. } | Directive::InvalidAuthoringSegment { .. }
         )
         .then_some((segment, parsed.diagnostics))
-    }
-
-    fn could_name_authoring_namespace(&self, source: &str) -> bool {
-        let Some(tail) = source.strip_prefix("<ps") else {
-            return false;
-        };
-        let tail = tail.trim_start();
-        let Some(name) = tail.strip_prefix('@').or_else(|| tail.strip_prefix('＠')) else {
-            return tail.is_empty();
-        };
-        let candidate = name
-            .split([':', '(', '>', ' ', '\t'])
-            .next()
-            .unwrap_or(name);
-        candidate.is_empty()
-            || self
-                .authoring_namespaces
-                .iter()
-                .any(|namespace| namespace.starts_with(&normalize(candidate)))
     }
 
     fn looks_declared_authoring_prefix(&self, source: &str) -> bool {
@@ -2320,6 +2542,176 @@ mod tests {
             assert_eq!(
                 first.directives.len() + second.directives.len() + last.directives.len(),
                 1
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_authoring_releases_prose_and_bounds_ambiguous_lines() {
+        let parser = Parser::new().authoring_namespace("agency");
+        let mut prose = parser.authoring_stream();
+        let text = "ordinary prose ".repeat(8_000);
+        let out = prose.push(&text);
+        assert_eq!(out.data_plane, text);
+        assert!(prose.pending.is_empty());
+
+        let mut overflow = parser.authoring_stream();
+        let prefix = "\u{2003}".repeat(AUTHORING_STREAM_MAX_UNDECIDED_BYTES / 3);
+        let mut ambiguous = prefix;
+        ambiguous.push_str("<ps @agency:items.add(");
+        let first = overflow.push(&ambiguous);
+        assert!(first.data_plane.is_empty());
+        assert!(overflow.pending.len() <= AUTHORING_STREAM_MAX_UNDECIDED_BYTES);
+        assert!(overflow.overflow);
+        let remainder = "x".repeat(70_000);
+        let _ = overflow.push(&remainder);
+        let mut end = overflow.push("\nAfter");
+        end.append(overflow.finish());
+        assert_eq!(end.data_plane, "After");
+        assert_eq!(end.diagnostics.len(), 1);
+        assert_eq!(
+            end.diagnostics[0].span,
+            SourceSpan::new(0, ambiguous.len() + remainder.len())
+        );
+        assert!(end.diagnostics[0].message.contains("64 KiB"));
+    }
+
+    #[test]
+    fn incremental_authoring_releases_closed_undeclared_prefixes_before_long_tails() {
+        let parser = Parser::new().authoring_namespace("agency");
+        let tail = format!("{}\n", "x".repeat(64 * 1024));
+
+        for prefix in ["<ps @other>", "<ps@other("] {
+            let mut partitioned = parser.authoring_stream();
+            let first = partitioned.push(prefix);
+            assert_eq!(first.data_plane, prefix);
+            assert!(first.directives.is_empty());
+            assert!(first.diagnostics.is_empty());
+
+            let second = partitioned.push(&tail);
+            assert_eq!(second.data_plane, tail);
+            assert!(second.directives.is_empty());
+            assert!(second.diagnostics.is_empty());
+            assert!(partitioned.finish().data_plane.is_empty());
+
+            let source = format!("{prefix}{tail}");
+            let mut single_chunk = parser.authoring_stream();
+            let output = single_chunk.push(&source);
+            assert_eq!(output.data_plane, source);
+            assert!(output.directives.is_empty());
+            assert!(output.diagnostics.is_empty());
+
+            let split_points = [
+                0,
+                1,
+                prefix.len() - 1,
+                prefix.len(),
+                prefix.len() + 1,
+                source.len() / 2,
+                source.len() - 1,
+                source.len(),
+            ];
+            for split in split_points {
+                let mut stream = parser.authoring_stream();
+                let mut output = StreamOutput::default();
+                output.append(stream.push(&source[..split]));
+                output.append(stream.push(&source[split..]));
+                output.append(stream.finish());
+                assert_eq!(output.data_plane, source, "{prefix}, split {split}");
+                assert!(output.directives.is_empty());
+                assert!(output.diagnostics.is_empty());
+            }
+        }
+
+        for source in ["<ps @ag>\n", "<ps@ag(\n"] {
+            let mut stream = parser.authoring_stream();
+            let output = stream.push(source);
+            assert!(output.data_plane.is_empty());
+            assert_eq!(output.diagnostics.len(), 1);
+            assert_eq!(output.diagnostics[0].code, DiagnosticCode::SyntaxInvalid);
+            assert_eq!(
+                output.diagnostics[0].span,
+                SourceSpan::new(0, source.len() - 1)
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_authoring_keeps_quoted_tag_ends_and_unicode_separated_spaces() {
+        let parser = Parser::new().authoring_namespace("agency");
+        let undeclared = r#"<ps @other attr="a \" > b">"#;
+        let first_tag_end = undeclared.find('>').unwrap();
+        let mut stream = parser.authoring_stream();
+        let prefix = stream.push(&undeclared[..=first_tag_end]);
+        assert!(prefix.data_plane.is_empty());
+        let end = stream.push(&undeclared[first_tag_end + 1..]);
+        assert_eq!(end.data_plane, undeclared);
+        assert!(end.directives.is_empty());
+        assert!(end.diagnostics.is_empty());
+
+        let directive = r#"<ps @agency:items.add(ref: "t1")>"#;
+        let source = format!(" \u{2003}   {directive}\n");
+        for split in source
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain([source.len()])
+        {
+            let mut stream = parser.authoring_stream();
+            let mut output = StreamOutput::default();
+            output.append(stream.push(&source[..split]));
+            output.append(stream.push(&source[split..]));
+            output.append(stream.finish());
+            assert!(output.data_plane.is_empty(), "split {split}");
+            assert_eq!(output.directives.len(), 1, "split {split}");
+            assert_eq!(output.directives[0].source, directive);
+            assert_eq!(
+                output.directives[0].span,
+                SourceSpan::new(" \u{2003}   ".len(), " \u{2003}   ".len() + directive.len())
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_authoring_overflow_does_not_emit_lf_after_prose_transition() {
+        let parser = Parser::new().authoring_namespace("agency");
+        let source = format!(
+            "<ps @agency{}>\n",
+            "x".repeat(AUTHORING_STREAM_MAX_UNDECIDED_BYTES)
+        );
+
+        for split in [0, "<ps @agency".len(), source.len() - 1, source.len()] {
+            let mut stream = parser.authoring_stream();
+            let mut output = StreamOutput::default();
+            output.append(stream.push(&source[..split]));
+            output.append(stream.push(&source[split..]));
+            output.append(stream.finish());
+            assert!(output.data_plane.is_empty());
+            assert!(output.directives.is_empty());
+            assert_eq!(output.diagnostics.len(), 1);
+            assert_eq!(
+                output.diagnostics[0].span,
+                SourceSpan::new(0, source.len() - 1)
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_authoring_partitioning_preserves_absolute_offsets_after_suppression() {
+        let prefix = "Before é\n";
+        let directive = "<ps @agency:items.add(ref: \"t1\")>";
+        let source = format!("{prefix}{directive}\r\nAfter");
+        let parser = Parser::new().authoring_namespace("agency");
+        for split in source.char_indices().map(|(i, _)| i).chain([source.len()]) {
+            let mut stream = parser.authoring_stream();
+            let mut result = StreamOutput::default();
+            result.append(stream.push(&source[..split]));
+            result.append(stream.push(&source[split..]));
+            result.append(stream.finish());
+            assert_eq!(result.data_plane, "Before é\nAfter", "split {split}");
+            assert_eq!(result.directives.len(), 1, "split {split}");
+            assert_eq!(
+                result.directives[0].span,
+                SourceSpan::new(prefix.len(), prefix.len() + directive.len())
             );
         }
     }
