@@ -5,7 +5,7 @@
 //! messages, or model output unless a higher-authority promotion has made that content
 //! an authoring segment.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization as _;
@@ -220,126 +220,359 @@ impl StreamOutput {
 /// Providers may split a directive at any UTF-8 chunk boundary, including the
 /// final `>`. This decoder holds only a line that can still become a declared
 /// `<ps @namespace:...>` segment. Ordinary text continues streaming. Markdown
-/// blockquotes, indented code, and fenced code remain inert.
+/// blockquotes, indented code, and fenced code remain inert. Ambiguous input on
+/// one physical line is retained up to 64 KiB; a longer undecided line is
+/// suppressed with a limit diagnostic at its line boundary.
 #[derive(Debug, Clone)]
 pub struct AuthoringStream {
     parser: Parser,
-    line: String,
-    emitted: usize,
+    pending: String,
     offset: usize,
     fence: Option<(char, usize)>,
+    line_start: usize,
+    line_len: usize,
+    first_non_whitespace: Option<usize>,
+    raw_gate: bool,
+    leading_spaces: usize,
+    tag: TagProbe,
+    probe: Probe,
+    overflow: bool,
+    fence_probe: FenceProbe,
+    line_emitted: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TagProbe {
+    had_space: bool,
+    quote: Option<char>,
+    escaped: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FenceProbe {
+    marker: Option<char>,
+    width: usize,
+    tail: bool,
+    run_done: bool,
+}
+
+const AUTHORING_STREAM_MAX_UNDECIDED_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Probe {
+    Start,
+    P,
+    S,
+    AfterPs,
+    Sigil,
+    Name,
+    Control,
+    Prose,
 }
 
 impl AuthoringStream {
     /// Consume one provider text chunk.
     #[must_use]
     pub fn push(&mut self, chunk: &str) -> StreamOutput {
-        self.line.push_str(chunk);
         let mut output = StreamOutput::default();
-
-        while let Some(newline) = self.line.find('\n') {
-            let end = newline + 1;
-            let complete = self.line[..end].to_string();
-            output.append(self.complete_line(&complete, true));
-            self.line.drain(..end);
-            self.offset += end;
-            self.emitted = 0;
+        for ch in chunk.chars() {
+            if ch == '\n' {
+                output.append(self.finish_line(true));
+            } else {
+                self.observe(ch, &mut output);
+                self.offset += ch.len_utf8();
+            }
         }
-
-        if !self.could_be_authoring_control() {
-            output
-                .data_plane
-                .push_str(&self.line[self.emitted.min(self.line.len())..]);
-            self.emitted = self.line.len();
-        }
-
         output
     }
 
     /// Resolve the final line when the provider stream ends without a newline.
     #[must_use]
     pub fn finish(&mut self) -> StreamOutput {
-        if self.line.is_empty() {
+        if self.line_len == 0 {
             return StreamOutput::default();
         }
-        let complete = std::mem::take(&mut self.line);
-        let output = self.complete_line(&complete, false);
-        self.offset += complete.len();
-        self.emitted = 0;
-        output
+        self.finish_line(false)
     }
 
-    fn complete_line(&mut self, line: &str, has_newline: bool) -> StreamOutput {
-        let content = line.trim_end_matches(['\r', '\n']);
-        let trimmed = content.trim();
-        let leading = content.len() - content.trim_start().len();
-        let mut output = StreamOutput::default();
-
-        let inert = content.starts_with("    ")
-            || content.starts_with('\t')
-            || trimmed.starts_with('>')
-            || self.update_fence(trimmed)
-            || self.fence.is_some();
-
-        if !inert
-            && let Some((mut directive, mut diagnostics)) =
-                self.parser.standalone_authoring(trimmed)
-        {
-            shift_directive_segment(&mut directive, self.offset + leading);
-            for diagnostic in &mut diagnostics {
-                shift_span(&mut diagnostic.span, self.offset + leading);
-            }
-            output.directives.push(directive);
-            output.diagnostics.append(&mut diagnostics);
-            return output;
+    fn observe(&mut self, ch: char, output: &mut StreamOutput) {
+        let width = ch.len_utf8();
+        let relative = self.line_len;
+        self.line_len += width;
+        if ch == '\t' && relative == 0 {
+            self.raw_gate = true;
         }
+        if self.first_non_whitespace.is_none() {
+            if ch == ' ' && relative == self.leading_spaces {
+                self.leading_spaces += 1;
+                if self.leading_spaces >= 4 {
+                    self.raw_gate = true;
+                }
+            }
+            if !ch.is_whitespace() {
+                self.first_non_whitespace = Some(relative);
+                if matches!(ch, '`' | '~') {
+                    self.fence_probe.marker = Some(ch);
+                    self.fence_probe.width = 1;
+                    self.probe = Probe::Prose;
+                } else if ch == '>' {
+                    self.probe = Probe::Prose;
+                }
+            }
+        } else if self.fence_probe.marker.is_some() {
+            if !self.fence_probe.run_done && Some(ch) == self.fence_probe.marker {
+                self.fence_probe.width += 1;
+            } else {
+                self.fence_probe.run_done = true;
+                if !ch.is_whitespace() {
+                    self.fence_probe.tail = true;
+                }
+            }
+        }
+        if self.fence.is_some() {
+            self.probe = Probe::Prose;
+        }
+        if self.raw_gate {
+            self.probe = Probe::Prose;
+        }
+        if self.probe != Probe::Prose && !self.parser.authoring_namespaces.is_empty() {
+            self.advance_probe(ch);
+        } else if self.parser.authoring_namespaces.is_empty() {
+            self.probe = Probe::Prose;
+        }
+        if self.probe == Probe::Prose {
+            if !self.overflow {
+                output.data_plane.push_str(&self.pending);
+                output.data_plane.push(ch);
+                self.line_emitted = true;
+            }
+            self.pending.clear();
+        } else if !self.overflow {
+            if self.pending.len() + width <= AUTHORING_STREAM_MAX_UNDECIDED_BYTES {
+                self.pending.push(ch);
+            } else {
+                self.pending.clear();
+                self.overflow = true;
+            }
+        }
+    }
 
-        if !inert && self.parser.looks_declared_authoring_prefix(trimmed) {
+    fn advance_probe(&mut self, ch: char) {
+        self.probe = match self.probe {
+            Probe::Start => {
+                if ch == '<' {
+                    Probe::P
+                } else if ch.is_whitespace() {
+                    Probe::Start
+                } else {
+                    Probe::Prose
+                }
+            }
+            Probe::P => {
+                if ch == 'p' {
+                    Probe::S
+                } else {
+                    Probe::Prose
+                }
+            }
+            Probe::S => {
+                if ch == 's' {
+                    Probe::AfterPs
+                } else {
+                    Probe::Prose
+                }
+            }
+            Probe::AfterPs => {
+                if ch.is_whitespace() {
+                    self.tag.had_space = true;
+                    Probe::AfterPs
+                } else if matches!(ch, '@' | '＠') {
+                    Probe::Sigil
+                } else {
+                    Probe::Prose
+                }
+            }
+            Probe::Sigil | Probe::Name if ch == ':' => {
+                self.classify_colon();
+                if self.probe == Probe::Prose {
+                    Probe::Prose
+                } else {
+                    Probe::Control
+                }
+            }
+            Probe::Sigil if self.tag.had_space && ch == '>' => {
+                self.observe_tag_quote(ch);
+                self.classify_legacy_delimiter(ch);
+                if self.probe == Probe::Prose {
+                    Probe::Prose
+                } else {
+                    Probe::Control
+                }
+            }
+            Probe::Sigil if !self.tag.had_space && matches!(ch, '(' | '>' | ' ' | '\t') => {
+                self.classify_legacy_delimiter(ch);
+                if self.probe == Probe::Prose {
+                    Probe::Prose
+                } else {
+                    Probe::Name
+                }
+            }
+            Probe::Sigil => {
+                self.observe_tag_quote(ch);
+                Probe::Name
+            }
+            Probe::Name if self.tag.had_space => {
+                let tag_end = self.observe_tag_quote(ch);
+                if tag_end {
+                    self.classify_legacy_delimiter(ch);
+                    if self.probe == Probe::Prose {
+                        Probe::Prose
+                    } else {
+                        Probe::Control
+                    }
+                } else {
+                    Probe::Name
+                }
+            }
+            Probe::Name if matches!(ch, '(' | '>' | ' ' | '\t') => {
+                self.classify_legacy_delimiter(ch);
+                if self.probe == Probe::Prose {
+                    Probe::Prose
+                } else {
+                    Probe::Name
+                }
+            }
+            Probe::Name => Probe::Name,
+            other => other,
+        };
+    }
+
+    fn observe_tag_quote(&mut self, ch: char) -> bool {
+        if self.tag.escaped {
+            self.tag.escaped = false;
+            return false;
+        }
+        if ch == '\\' && self.tag.quote.is_some() {
+            self.tag.escaped = true;
+            return false;
+        }
+        match (self.tag.quote, ch) {
+            (Some(quote), current) if quote == current => self.tag.quote = None,
+            (None, '\'' | '"') => self.tag.quote = Some(ch),
+            (None, '>') => return true,
+            _ => {}
+        }
+        false
+    }
+
+    fn classify_legacy_delimiter(&mut self, delimiter: char) {
+        let candidate = format!("{}{delimiter}", self.pending);
+        if !self.parser.looks_declared_authoring_prefix(&candidate) {
+            self.probe = Probe::Prose;
+        }
+    }
+
+    fn classify_colon(&mut self) {
+        let candidate = format!("{}:", self.pending);
+        let trimmed = candidate.trim();
+        let header = trimmed.strip_prefix("<ps").unwrap_or(trimmed).trim();
+        if !self.parser.looks_declared_authoring_prefix(trimmed)
+            && !self.parser.is_declared_authoring_header(header)
+        {
+            self.probe = Probe::Prose;
+        }
+    }
+
+    fn finish_line(&mut self, has_newline: bool) -> StreamOutput {
+        let mut output = StreamOutput::default();
+        let line_end = self.offset;
+        let candidate_fence =
+            !self.raw_gate && self.fence_probe.marker.is_some() && self.fence_probe.width >= 3;
+        let was_fenced = self.fence.is_some();
+        if candidate_fence {
+            match self.fence {
+                None => {
+                    self.fence = Some((self.fence_probe.marker.unwrap(), self.fence_probe.width));
+                }
+                Some((marker, width))
+                    if Some(marker) == self.fence_probe.marker
+                        && self.fence_probe.width >= width
+                        && !self.fence_probe.tail =>
+                {
+                    self.fence = None;
+                }
+                _ => {}
+            }
+        }
+        if self.overflow {
             output.diagnostics.push(Diagnostic {
                 code: DiagnosticCode::SyntaxInvalid,
-                message: "incomplete declared Prompt Syntax authoring segment".into(),
-                span: SourceSpan::new(self.offset + leading, self.offset + content.len()),
+                message: "authoring stream line exceeds 64 KiB undecided-input limit".into(),
+                span: SourceSpan::new(self.line_start, line_end),
             });
-            return output;
-        }
-
-        output
-            .data_plane
-            .push_str(&line[self.emitted.min(line.len())..]);
-        if !has_newline {
-            self.emitted = line.len();
-        }
-        output
-    }
-
-    fn update_fence(&mut self, trimmed: &str) -> bool {
-        let Some((marker, width, tail)) = markdown_fence_marker(trimmed) else {
-            return false;
-        };
-        match self.fence {
-            None => self.fence = Some((marker, width)),
-            Some((open, minimum))
-                if marker == open && width >= minimum && tail.trim().is_empty() =>
+        } else if self.probe != Probe::Prose && !self.pending.is_empty() {
+            let content = self.pending.trim_end_matches('\r');
+            let trimmed = content.trim();
+            let leading = content.len() - content.trim_start().len();
+            if !was_fenced
+                && !self.raw_gate
+                && let Some((mut directive, mut diagnostics)) =
+                    self.parser.standalone_authoring(trimmed)
             {
-                self.fence = None;
+                shift_directive_segment(&mut directive, self.line_start + leading);
+                for diagnostic in &mut diagnostics {
+                    shift_span(&mut diagnostic.span, self.line_start + leading);
+                }
+                output.directives.push(directive);
+                output.diagnostics.append(&mut diagnostics);
+            } else if !was_fenced
+                && !self.raw_gate
+                && self.parser.looks_declared_authoring_prefix(trimmed)
+            {
+                output.diagnostics.push(Diagnostic {
+                    code: DiagnosticCode::SyntaxInvalid,
+                    message: "incomplete declared Prompt Syntax authoring segment".into(),
+                    span: SourceSpan::new(
+                        self.line_start + leading,
+                        self.line_start + content.len(),
+                    ),
+                });
+            } else {
+                output.data_plane.push_str(&self.pending);
             }
-            Some(_) => {}
         }
-        true
-    }
-
-    fn could_be_authoring_control(&self) -> bool {
-        if self.fence.is_some() || self.line.starts_with("    ") || self.line.starts_with('\t') {
-            return false;
+        if has_newline
+            && (self.line_emitted
+                || (!self.overflow
+                    && output.directives.is_empty()
+                    && output.diagnostics.is_empty()))
+        {
+            output.data_plane.push('\n');
         }
-        let trimmed = self.line.trim_start_matches(' ');
-        if self.line.len() - trimmed.len() > 3 || trimmed.starts_with('>') {
-            return false;
+        if has_newline {
+            self.offset += 1;
         }
-        if trimmed.is_empty() || "<ps".starts_with(trimmed) {
-            return true;
-        }
-        trimmed.starts_with("<ps") && self.parser.could_name_authoring_namespace(trimmed)
+        self.line_start = self.offset;
+        self.line_len = 0;
+        self.pending.clear();
+        self.first_non_whitespace = None;
+        self.raw_gate = false;
+        self.leading_spaces = 0;
+        self.tag.had_space = false;
+        self.tag.quote = None;
+        self.tag.escaped = false;
+        self.probe = if self.fence.is_some() {
+            Probe::Prose
+        } else {
+            Probe::Start
+        };
+        self.overflow = false;
+        self.line_emitted = false;
+        self.fence_probe.marker = None;
+        self.fence_probe.width = 0;
+        self.fence_probe.tail = false;
+        self.fence_probe.run_done = false;
+        output
     }
 }
 
@@ -449,10 +682,19 @@ impl Parser {
     pub fn authoring_stream(&self) -> AuthoringStream {
         AuthoringStream {
             parser: self.clone(),
-            line: String::new(),
-            emitted: 0,
+            pending: String::new(),
             offset: 0,
             fence: None,
+            line_start: 0,
+            line_len: 0,
+            first_non_whitespace: None,
+            raw_gate: false,
+            leading_spaces: 0,
+            tag: TagProbe::default(),
+            probe: Probe::Start,
+            overflow: false,
+            fence_probe: FenceProbe::default(),
+            line_emitted: false,
         }
     }
 
@@ -460,12 +702,27 @@ impl Parser {
     #[must_use]
     pub fn parse(&self, source: &str) -> ParsedPrompt {
         let mut diagnostics = Vec::new();
-        let segments = self.parse_region(source, 0, &mut diagnostics, true);
+        let segments = self.parse_region(source, 0, &mut diagnostics, true, 0);
         ParsedPrompt {
             source: source.to_string(),
             segments,
             diagnostics,
         }
+    }
+
+    fn depth_limit_segments(
+        source: &str,
+        base: usize,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Vec<Segment> {
+        diagnostics.push(Diagnostic {
+            code: DiagnosticCode::SyntaxInvalid,
+            message: "Prompt Syntax span depth exceeds 32".into(),
+            span: SourceSpan::new(base, base + source.len()),
+        });
+        let mut segments = Vec::new();
+        push_text(source, base, 0, source.len(), &mut segments);
+        segments
     }
 
     fn parse_region(
@@ -474,7 +731,14 @@ impl Parser {
         base: usize,
         diagnostics: &mut Vec<Diagnostic>,
         document_start: bool,
+        depth: usize,
     ) -> Vec<Segment> {
+        if depth >= 32 {
+            return Self::depth_limit_segments(source, base, diagnostics);
+        }
+        // Keep the memo tables empty unless this region reaches a real span
+        // candidate after the parser's normal fence, URL, and markup skips.
+        let mut span_lookup = SpanLookup::default();
         let mut segments = Vec::new();
         let mut cursor = 0;
         let mut text_start = 0;
@@ -506,12 +770,9 @@ impl Parser {
         }
 
         while cursor < source.len() {
-            if let Some(end) = fenced_block_end(source, cursor) {
-                cursor = end;
-                continue;
-            }
-
-            if let Some(end) = url_like_end(source, cursor) {
+            if let Some(end) =
+                fenced_block_end(source, cursor).or_else(|| url_like_end(source, cursor))
+            {
                 cursor = end;
                 continue;
             }
@@ -521,16 +782,9 @@ impl Parser {
                 break;
             };
 
-            if ch == '\\' {
-                let next = cursor + ch.len_utf8();
-                if source[next..]
-                    .chars()
-                    .next()
-                    .is_some_and(|next| matches!(next, '@' | '/' | '＠' | '／'))
-                {
-                    cursor = next + source[next..].chars().next().map_or(0, char::len_utf8);
-                    continue;
-                }
+            if let Some(end) = escaped_sigil_end(source, cursor) {
+                cursor = end;
+                continue;
             }
 
             let starts_ps =
@@ -553,13 +807,9 @@ impl Parser {
             }
 
             let parsed = if starts_ps {
-                self.parse_span(source, cursor, base, diagnostics)
-            } else if matches!(ch, '@' | '＠') && boundary_before(source, cursor) {
-                self.parse_reference_or_route(source, cursor, base, diagnostics)
-            } else if matches!(ch, '/' | '／') && boundary_before(source, cursor) {
-                self.parse_action(source, cursor, base, diagnostics)
+                self.parse_span(source, cursor, base, diagnostics, depth, &mut span_lookup)
             } else {
-                None
+                self.parse_point_directive(source, cursor, Some((base, diagnostics)))
             };
 
             if let Some((end, directive)) = parsed {
@@ -575,7 +825,7 @@ impl Parser {
                 // A `<ps ...>` header that failed as a whole stays inert as a whole.
                 // Do not resume scanning inside it and accidentally promote one of its
                 // references as an independent point directive.
-                if starts_ps && let Some(end) = find_tag_end(source, cursor + 3) {
+                if starts_ps && let Some(end) = span_lookup.tag_end(source, cursor + 3) {
                     cursor = end + 1;
                     continue;
                 }
@@ -600,21 +850,24 @@ impl Parser {
         &self,
         source: &str,
         start: usize,
-        base: usize,
-        diagnostics: &mut Vec<Diagnostic>,
+        mut diagnostic_sink: Option<(usize, &mut Vec<Diagnostic>)>,
     ) -> Option<(usize, Directive)> {
         let parsed = match parse_reference(source, start) {
             Ok(reference) => reference,
             Err(error) => {
-                if looks_qualified(source, start) {
-                    diagnostics.push(error.at(base));
+                if let Some((base, diagnostics)) = diagnostic_sink.as_mut()
+                    && looks_qualified(source, start)
+                {
+                    diagnostics.push(error.at(*base));
                 }
                 return None;
             }
         };
         let hinted_end = island_hint_end(source, start).max(parsed.end);
         if contains_bidi(&source[start..hinted_end]) {
-            diagnostics.push(ParseFailure::bidi(start, hinted_end).at(base));
+            if let Some((base, diagnostics)) = diagnostic_sink.as_mut() {
+                diagnostics.push(ParseFailure::bidi(start, hinted_end).at(*base));
+            }
             return None;
         }
         if !self.reference_is_live(&parsed.value) {
@@ -689,27 +942,47 @@ impl Parser {
         &self,
         source: &str,
         start: usize,
-        base: usize,
-        diagnostics: &mut Vec<Diagnostic>,
+        mut diagnostic_sink: Option<(usize, &mut Vec<Diagnostic>)>,
     ) -> Option<(usize, Directive)> {
         let parsed = match parse_action(source, start) {
             Ok(action) => action,
             Err(error) => {
-                if self.action_prefix_is_live(source, start) {
-                    diagnostics.push(error.at(base));
+                if let Some((base, diagnostics)) = diagnostic_sink.as_mut()
+                    && self.action_prefix_is_live(source, start)
+                {
+                    diagnostics.push(error.at(*base));
                 }
                 return None;
             }
         };
         let hinted_end = island_hint_end(source, start).max(parsed.end);
         if contains_bidi(&source[start..hinted_end]) {
-            diagnostics.push(ParseFailure::bidi(start, hinted_end).at(base));
+            if let Some((base, diagnostics)) = diagnostic_sink.as_mut() {
+                diagnostics.push(ParseFailure::bidi(start, hinted_end).at(*base));
+            }
             return None;
         }
         if !self.actions.contains(&normalize(&parsed.value.name)) {
             return None;
         }
         Some((parsed.end, Directive::Action(parsed.value)))
+    }
+
+    fn parse_point_directive(
+        &self,
+        source: &str,
+        start: usize,
+        diagnostic_sink: Option<(usize, &mut Vec<Diagnostic>)>,
+    ) -> Option<(usize, Directive)> {
+        let sigil = source.get(start..)?.chars().next()?;
+        if !boundary_before(source, start) {
+            return None;
+        }
+        match sigil {
+            '@' | '＠' => self.parse_reference_or_route(source, start, diagnostic_sink),
+            '/' | '／' => self.parse_action(source, start, diagnostic_sink),
+            _ => None,
+        }
     }
 
     fn action_prefix_is_live(&self, source: &str, start: usize) -> bool {
@@ -727,8 +1000,10 @@ impl Parser {
         start: usize,
         base: usize,
         diagnostics: &mut Vec<Diagnostic>,
+        depth: usize,
+        span_lookup: &mut SpanLookup,
     ) -> Option<(usize, Directive)> {
-        let header_end = find_tag_end(source, start + 3)?;
+        let header_end = span_lookup.tag_end(source, start + 3)?;
         let header = &source[start + 3..header_end];
         if contains_bidi(header) {
             diagnostics.push(ParseFailure::bidi(start, header_end + 1).at(base));
@@ -745,7 +1020,7 @@ impl Parser {
             return None;
         }
         let body_start = header_end + 1;
-        let Some(close) = find_span_close(source, body_start) else {
+        let Some(close) = span_lookup.close_for(self, source, body_start) else {
             if line_tail_is_empty(source, body_start) {
                 if let Ok(reference) = parse_reference(header.trim(), 0)
                     && reference.end == header.trim().len()
@@ -796,7 +1071,7 @@ impl Parser {
                 attributes: Vec::new(),
             }
         });
-        let segments = self.parse_region(body, base + body_start, diagnostics, false);
+        let segments = self.parse_region(body, base + body_start, diagnostics, false, depth + 1);
         let end = close + "</ps>".len();
         Some((
             end,
@@ -897,25 +1172,6 @@ impl Parser {
             Directive::AuthoringSegment { .. } | Directive::InvalidAuthoringSegment { .. }
         )
         .then_some((segment, parsed.diagnostics))
-    }
-
-    fn could_name_authoring_namespace(&self, source: &str) -> bool {
-        let Some(tail) = source.strip_prefix("<ps") else {
-            return false;
-        };
-        let tail = tail.trim_start();
-        let Some(name) = tail.strip_prefix('@').or_else(|| tail.strip_prefix('＠')) else {
-            return tail.is_empty();
-        };
-        let candidate = name
-            .split([':', '(', '>', ' ', '\t'])
-            .next()
-            .unwrap_or(name);
-        candidate.is_empty()
-            || self
-                .authoring_namespaces
-                .iter()
-                .any(|namespace| namespace.starts_with(&normalize(candidate)))
     }
 
     fn looks_declared_authoring_prefix(&self, source: &str) -> bool {
@@ -1314,36 +1570,110 @@ fn fenced_block_end(source: &str, start: usize) -> Option<usize> {
     if start > 0 && source.as_bytes().get(start.wrapping_sub(1)) != Some(&b'\n') {
         return None;
     }
-    let line_end = source[start..]
+    let (marker, width) = fence_opener(&source[start..])?;
+    let mut cursor = source[start..]
         .find('\n')
         .map_or(source.len(), |at| start + at + 1);
-    let line = source[start..line_end].trim_end_matches(['\r', '\n']);
-    let indent = line.chars().take_while(|ch| *ch == ' ').count();
-    if indent > 3 {
-        return None;
-    }
-    let trimmed = &line[indent..];
-    let marker = trimmed.chars().next()?;
-    if !matches!(marker, '`' | '~') {
-        return None;
-    }
-    let width = trimmed.chars().take_while(|ch| *ch == marker).count();
-    if width < 3 {
-        return None;
-    }
-    let mut cursor = line_end;
     while cursor < source.len() {
         let next = source[cursor..]
             .find('\n')
             .map_or(source.len(), |at| cursor + at + 1);
-        let candidate = source[cursor..next].trim_end_matches(['\r', '\n']).trim();
-        let close_width = candidate.chars().take_while(|ch| *ch == marker).count();
-        if close_width >= width && candidate[close_width..].trim().is_empty() {
+        if fence_closer(&source[cursor..next]).is_some_and(|(close_marker, close_width)| {
+            close_marker == marker && close_width >= width
+        }) {
             return Some(next);
         }
         cursor = next;
     }
     Some(source.len())
+}
+
+fn fence_opener(source: &str) -> Option<(char, usize)> {
+    let indent = source.chars().take(4).take_while(|ch| *ch == ' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let (marker, width, _) = markdown_fence_marker(&source[indent..])?;
+    Some((marker, width))
+}
+
+fn fence_closer(line: &str) -> Option<(char, usize)> {
+    let (marker, width, tail) = markdown_fence_marker(line.trim())?;
+    tail.is_empty().then_some((marker, width))
+}
+
+struct ClosingFenceLine {
+    start: usize,
+    end: usize,
+}
+
+struct ClosingFenceIndex {
+    lines: Vec<ClosingFenceLine>,
+    leaf_count: usize,
+    max_widths: Vec<[usize; 2]>,
+}
+
+impl ClosingFenceIndex {
+    fn new(source: &str) -> Self {
+        let mut lines = Vec::new();
+        let mut widths = Vec::new();
+        let mut start = 0;
+        for line in source.split_inclusive('\n') {
+            let end = start + line.len();
+            if let Some((marker, width)) = fence_closer(line) {
+                lines.push(ClosingFenceLine { start, end });
+                let mut marker_widths = [0; 2];
+                marker_widths[usize::from(marker == '~')] = width;
+                widths.push(marker_widths);
+            }
+            start = end;
+        }
+
+        let leaf_count = lines.len().next_power_of_two();
+        let mut max_widths = vec![[0; 2]; leaf_count * 2];
+        max_widths[leaf_count..leaf_count + widths.len()].copy_from_slice(&widths);
+        for node in (1..leaf_count).rev() {
+            max_widths[node] = std::array::from_fn(|marker| {
+                max_widths[node * 2][marker].max(max_widths[node * 2 + 1][marker])
+            });
+        }
+        Self {
+            lines,
+            leaf_count,
+            max_widths,
+        }
+    }
+
+    fn next_end(&self, body_start: usize, marker: char, width: usize) -> Option<usize> {
+        // A physical line starts after the body byte only if it follows the opener line.
+        let first = self.lines.partition_point(|line| line.start <= body_start);
+        if first == self.lines.len() {
+            return None;
+        }
+
+        let marker = usize::from(marker == '~');
+        let mut node = self.leaf_count + first;
+        if self.max_widths[node][marker] < width {
+            // Visit right siblings in source order until one can hold a match.
+            loop {
+                if node == 1 {
+                    return None;
+                }
+                if node & 1 == 0 && self.max_widths[node + 1][marker] >= width {
+                    node += 1;
+                    break;
+                }
+                node /= 2;
+            }
+        }
+        while node < self.leaf_count {
+            node *= 2;
+            if self.max_widths[node][marker] < width {
+                node += 1;
+            }
+        }
+        Some(self.lines[node - self.leaf_count].end)
+    }
 }
 
 fn find_tag_end(source: &str, start: usize) -> Option<usize> {
@@ -1366,6 +1696,154 @@ fn find_tag_end(source: &str, start: usize) -> Option<usize> {
         }
     }
     None
+}
+
+#[derive(Default)]
+struct SpanLookup {
+    closing_fences: Option<ClosingFenceIndex>,
+    tag_ends: HashMap<usize, Option<usize>>,
+    closes: HashMap<usize, Option<usize>>,
+}
+
+impl SpanLookup {
+    fn matched_body_fence_end(&mut self, source: &str, body_start: usize) -> Option<usize> {
+        let (marker, width) = fence_opener(&source[body_start..])?;
+        self.closing_fences
+            .get_or_insert_with(|| ClosingFenceIndex::new(source))
+            .next_end(body_start, marker, width)
+    }
+
+    fn tag_end(&mut self, source: &str, start: usize) -> Option<usize> {
+        if let Some(result) = self.tag_ends.get(&start) {
+            return *result;
+        }
+        let result = find_tag_end(source, start);
+        if let Some(end) = result {
+            self.tag_ends.insert(start, Some(end));
+        } else {
+            self.memoize_tag_suffix(source, start);
+            self.tag_ends.insert(start, None);
+        }
+        result
+    }
+
+    // A failed quote-aware scan reaches EOF. Reuse a reverse automaton pass
+    // to memoize the answers only at possible `<ps` header offsets in that
+    // suffix, so later candidates do not each rescan the malformed tail.
+    fn memoize_tag_suffix(&mut self, source: &str, suffix_start: usize) {
+        let mut candidates = Vec::new();
+        for (relative, _) in source[suffix_start..].char_indices() {
+            let opener = suffix_start + relative;
+            if source[opener..].starts_with("<ps") && boundary_after_ps(source, opener) {
+                candidates.push(opener + 3);
+            }
+        }
+
+        let mut next = [None; 5];
+        for (relative, ch) in source[suffix_start..].char_indices().rev() {
+            let at = suffix_start + relative;
+            let mut current = [None; 5];
+            for (state, result) in current.iter_mut().enumerate() {
+                let next_state = match state {
+                    0 => match ch {
+                        '>' => {
+                            *result = Some(at);
+                            continue;
+                        }
+                        '\'' => 1,
+                        '"' => 2,
+                        _ => 0,
+                    },
+                    1 => match ch {
+                        '\\' => 3,
+                        '\'' => 0,
+                        _ => 1,
+                    },
+                    2 => match ch {
+                        '\\' => 4,
+                        '"' => 0,
+                        _ => 2,
+                    },
+                    3 => 1,
+                    4 => 2,
+                    _ => unreachable!(),
+                };
+                *result = next[next_state];
+            }
+            if candidates.last() == Some(&at) {
+                candidates.pop();
+                self.tag_ends.insert(at, current[0]);
+            }
+            next = current;
+        }
+    }
+
+    fn close_for(&mut self, parser: &Parser, source: &str, start: usize) -> Option<usize> {
+        if let Some(result) = self.closes.get(&start) {
+            return *result;
+        }
+
+        let mut pending = vec![start];
+        let mut cursor = start;
+        while cursor < source.len() {
+            let fence_end = if pending.last().copied() == Some(cursor) {
+                self.matched_body_fence_end(source, cursor)
+            } else {
+                fenced_block_end(source, cursor)
+            };
+            if let Some(end) = fence_end {
+                cursor = end;
+                continue;
+            }
+            if let Some(end) =
+                url_like_end(source, cursor).or_else(|| escaped_sigil_end(source, cursor))
+            {
+                cursor = end;
+                continue;
+            }
+            if source[cursor..].starts_with("<ps") && boundary_after_ps(source, cursor) {
+                let Some(end) = self.tag_end(source, cursor + 3) else {
+                    for body_start in pending.drain(..) {
+                        self.closes.insert(body_start, None);
+                    }
+                    return None;
+                };
+                let body_start = end + 1;
+                if contains_bidi(&source[cursor + 3..end]) {
+                    cursor = body_start;
+                    continue;
+                }
+                pending.push(body_start);
+                cursor = body_start;
+                continue;
+            }
+            if source[cursor..].starts_with("</ps>") {
+                let body_start = pending.pop()?;
+                self.closes.insert(body_start, Some(cursor));
+                if pending.is_empty() {
+                    return Some(cursor);
+                }
+                cursor += "</ps>".len();
+                continue;
+            }
+            if source[cursor..].starts_with('<')
+                && let Some(inert) = other_tag_end(source, cursor)
+            {
+                cursor = inert.end + 1;
+                continue;
+            }
+            if let Some((end, _)) = parser.parse_point_directive(source, cursor, None) {
+                cursor = end;
+                continue;
+            }
+            cursor += source[cursor..].chars().next()?.len_utf8();
+        }
+
+        for body_start in pending {
+            self.closes.insert(body_start, None);
+        }
+        None
+    }
 }
 
 struct InertRegion {
@@ -1499,33 +1977,6 @@ fn url_like_end(source: &str, start: usize) -> Option<usize> {
     Some(cursor)
 }
 
-fn find_span_close(source: &str, start: usize) -> Option<usize> {
-    let mut cursor = start;
-    let mut depth = 1usize;
-    while cursor < source.len() {
-        if let Some(end) = fenced_block_end(source, cursor) {
-            cursor = end;
-            continue;
-        }
-        if source[cursor..].starts_with("<ps") && boundary_after_ps(source, cursor) {
-            let end = find_tag_end(source, cursor + 3)?;
-            depth += 1;
-            cursor = end + 1;
-            continue;
-        }
-        if source[cursor..].starts_with("</ps>") {
-            depth -= 1;
-            if depth == 0 {
-                return Some(cursor);
-            }
-            cursor += "</ps>".len();
-            continue;
-        }
-        cursor += source[cursor..].chars().next()?.len_utf8();
-    }
-    None
-}
-
 fn boundary_after_ps(source: &str, start: usize) -> bool {
     source[start + 3..]
         .chars()
@@ -1534,10 +1985,10 @@ fn boundary_after_ps(source: &str, start: usize) -> bool {
 }
 
 fn line_tail_is_empty(source: &str, start: usize) -> bool {
-    let end = source[start..]
-        .find(['\r', '\n'])
-        .map_or(source.len(), |offset| start + offset);
-    source[start..end].trim().is_empty()
+    source[start..]
+        .chars()
+        .take_while(|ch| !matches!(ch, '\r' | '\n'))
+        .all(char::is_whitespace)
 }
 
 fn boundary_before(source: &str, start: usize) -> bool {
@@ -1545,6 +1996,15 @@ fn boundary_before(source: &str, start: usize) -> bool {
         return true;
     };
     !previous.is_ascii_alphanumeric() && !matches!(previous, '_' | '.' | '-' | '\\')
+}
+
+fn escaped_sigil_end(source: &str, cursor: usize) -> Option<usize> {
+    if source.get(cursor..)?.chars().next()? != '\\' {
+        return None;
+    }
+    let sigil_start = cursor + '\\'.len_utf8();
+    let sigil = source.get(sigil_start..)?.chars().next()?;
+    matches!(sigil, '@' | '/' | '＠' | '／').then_some(sigil_start + sigil.len_utf8())
 }
 
 fn keyword(source: &str, start: usize, expected: &str) -> Option<usize> {
@@ -1616,13 +2076,190 @@ mod tests {
     use super::*;
 
     #[test]
+    fn structural_closers_respect_accepted_islands_and_inert_markup() {
+        for (source, expected) in [
+            (
+                "<ps><!-- </ps> @model:hidden --> @model:live</ps>",
+                "<!-- </ps> @model:hidden --> ",
+            ),
+            (
+                "<ps><![CDATA[</ps> @model:hidden]]> @model:live</ps>",
+                "<![CDATA[</ps> @model:hidden]]> ",
+            ),
+            (
+                "<ps><a title=\"</ps>\">x</a> @model:live</ps>",
+                "<a title=\"</ps>\">x</a> ",
+            ),
+            ("<ps>@tool:find(q: \"</ps>\")ok</ps>!", "ok!"),
+            ("<ps>／search(q: \"</ps>\")ok</ps>!", "ok!"),
+            ("<ps>a<b @model:live</ps>", "a<b "),
+        ] {
+            let parsed = Parser::new().action("search").parse(source);
+            assert_eq!(parsed.round_trip(), source);
+            assert_eq!(parsed.data_plane(), expected, "{source}");
+            assert!(parsed.diagnostics.is_empty(), "{source}");
+            let Segment::Directive(span) = &parsed.segments[0] else {
+                panic!("expected span")
+            };
+            assert_eq!(
+                span.span,
+                SourceSpan::new(0, source.rfind("</ps>").unwrap() + 5)
+            );
+        }
+    }
+
+    #[test]
+    fn structural_matching_preserves_rejected_and_escaped_islands() {
+        for source in [
+            "<ps>/search(q: \"</ps>\")</ps>",
+            "<ps>https://x/@tool:find(q: \"</ps>\")</ps>",
+            "<ps>\\@tool:find(q: \"</ps>\")</ps>",
+            "<ps>\\＠tool:find(q: \"</ps>\")</ps>",
+        ] {
+            let parsed = Parser::new().parse(source);
+            let close = source.find("</ps>").unwrap();
+            assert_eq!(parsed.round_trip(), source);
+            assert_eq!(
+                parsed.data_plane(),
+                format!("{}{}", &source[4..close], &source[close + 5..])
+            );
+            assert!(parsed.diagnostics.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn body_fence_matching_keeps_abandoned_outer_recovery() {
+        let source = "<ps>~~~\n<ps>inner</ps>\n~~~\n";
+        let parsed = Parser::new().parse(source);
+        assert_eq!(parsed.round_trip(), source);
+        assert_eq!(parsed.data_plane(), "<ps>~~~\ninner\n~~~\n");
+        assert_eq!(parsed.diagnostics.len(), 1);
+        assert_eq!(parsed.diagnostics[0].code, DiagnosticCode::UnclosedSpan);
+        let span = parsed
+            .segments
+            .iter()
+            .find_map(|segment| match segment {
+                Segment::Directive(directive) => Some(directive.span),
+                Segment::Text(_) => None,
+            })
+            .unwrap();
+        let start = source.find("<ps>inner").unwrap();
+        assert_eq!(span, SourceSpan::new(start, start + "<ps>inner</ps>".len()));
+
+        let source = "é<ps>~~~\n</ps> @model:hidden\n~~~\n@model:live</ps>!";
+        let parsed = Parser::new().parse(source);
+        assert_eq!(parsed.round_trip(), source);
+        assert_eq!(parsed.data_plane(), "é~~~\n</ps> @model:hidden\n~~~\n!");
+        assert!(parsed.diagnostics.is_empty());
+        assert_eq!(
+            parsed.segments.iter().find_map(|segment| match segment {
+                Segment::Directive(directive) => Some(directive.span),
+                Segment::Text(_) => None,
+            }),
+            Some(SourceSpan::new("é".len(), source.len() - 1))
+        );
+    }
+
+    #[test]
+    fn rejected_nested_header_cannot_establish_a_body_fence() {
+        let source = "<ps><ps \u{202e}>~~~\n</ps> @model:live\n~~~\n</ps></ps>";
+        let parsed = Parser::new().parse(source);
+        assert_eq!(parsed.round_trip(), source);
+        let spans: Vec<_> = parsed
+            .segments
+            .iter()
+            .filter_map(|segment| match segment {
+                Segment::Directive(directive) => Some(directive.span),
+                Segment::Text(_) => None,
+            })
+            .collect();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(
+            spans[0],
+            SourceSpan::new(0, source.find("</ps>").unwrap() + 5)
+        );
+        let reference_start = source.find("@model:live").unwrap();
+        assert_eq!(
+            spans[1],
+            SourceSpan::new(reference_start, reference_start + "@model:live".len())
+        );
+        assert_eq!(parsed.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn closing_fence_index_selects_earliest_sufficient_matching_marker() {
+        let source = "<ps>~~~info\r\ntext\n```\n~~~\n~~~~~\n\u{2003}````\u{2003}\n~~~~tail\n~~~~\n";
+        let index = ClosingFenceIndex::new(source);
+        let short = source.find("\n~~~\n").unwrap() + 1;
+        let wide = source.find("~~~~~").unwrap();
+        let backticks = source.find("\u{2003}````").unwrap();
+        assert_eq!(index.next_end(4, '~', 3), Some(short + 4));
+        assert_eq!(index.next_end(4, '~', 4), Some(wide + 6));
+        assert_eq!(index.next_end(wide, '~', 4), Some(source.len()));
+        assert_eq!(index.next_end(wide, '~', 5), None);
+        assert_eq!(
+            index.next_end(4, '`', 4),
+            Some(backticks + "\u{2003}````\u{2003}\n".len())
+        );
+        assert_eq!(index.next_end(4, '`', 5), None);
+        assert_eq!(index.next_end(source.len(), '~', 3), None);
+    }
+
+    #[test]
+    fn repeated_unmatched_body_fences_share_one_region_index() {
+        let source = "<ps>~~~\n".repeat(1024);
+        let mut lookup = SpanLookup::default();
+        for (start, _) in source.match_indices("~~~") {
+            assert_eq!(lookup.matched_body_fence_end(&source, start), None);
+        }
+        assert!(lookup.closing_fences.as_ref().unwrap().lines.is_empty());
+        assert_eq!(lookup.close_for(&Parser::new(), &source, 4), None);
+        assert_eq!(lookup.closes.len(), 1024);
+    }
+
+    #[test]
+    fn comment_opener_with_quote_does_not_hide_following_span() {
+        let source = "<!-- <ps \" -->\n<ps>body</ps>\n\">";
+        let parsed = Parser::new().parse(source);
+        let span_start = source.rfind("<ps>").unwrap();
+        let span_end = span_start + "<ps>body</ps>".len();
+        assert_eq!(parsed.round_trip(), source);
+        assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
+        assert_eq!(parsed.directives().count(), 1);
+        assert_eq!(
+            parsed.segments.iter().find_map(|segment| match segment {
+                Segment::Directive(directive) => Some(directive.span),
+                Segment::Text(_) => None,
+            }),
+            Some(SourceSpan::new(span_start, span_end))
+        );
+    }
+
+    #[test]
+    fn malformed_quoted_header_keeps_later_candidate_recovery() {
+        let source = "<ps title=\"broken <ps>inner</ps>";
+        let parsed = Parser::new().parse(source);
+        let inner_start = source.find("<ps>").unwrap();
+        assert_eq!(parsed.round_trip(), source);
+        assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
+        assert_eq!(parsed.directives().count(), 1);
+        assert_eq!(
+            parsed.segments.iter().find_map(|segment| match segment {
+                Segment::Directive(directive) => Some(directive.span),
+                Segment::Text(_) => None,
+            }),
+            Some(SourceSpan::new(inner_start, source.len()))
+        );
+    }
+
+    #[test]
     fn separates_control_and_data_planes_losslessly() {
         let source = "@opus Summarize @file:q3-report.md /concise";
         let parsed = Parser::new().entity("opus").action("concise").parse(source);
         assert_eq!(parsed.round_trip(), source);
         assert_eq!(parsed.data_plane(), " Summarize  ");
         assert_eq!(parsed.directives().count(), 3);
-        assert!(parsed.diagnostics.is_empty());
+        assert_eq!(parsed.diagnostics, [] as [Diagnostic; 0]);
     }
 
     #[test]
@@ -1639,7 +2276,7 @@ mod tests {
         let parsed = Parser::new().parse(source);
         assert_eq!(parsed.data_plane(), source);
         assert_eq!(parsed.directives().count(), 0);
-        assert!(parsed.diagnostics.is_empty());
+        assert_eq!(parsed.diagnostics, [] as [Diagnostic; 0]);
     }
 
     #[test]
@@ -1651,7 +2288,7 @@ mod tests {
             "for a<b the value  matters if x > y end"
         );
         assert_eq!(parsed.directives().count(), 1);
-        assert!(parsed.diagnostics.is_empty());
+        assert_eq!(parsed.diagnostics, [] as [Diagnostic; 0]);
     }
 
     #[test]
@@ -1673,7 +2310,7 @@ mod tests {
             "note://host/@model:atlas/atlas-4 then "
         );
         assert_eq!(parsed.directives().count(), 1);
-        assert!(parsed.diagnostics.is_empty());
+        assert_eq!(parsed.diagnostics, [] as [Diagnostic; 0]);
     }
 
     #[test]
@@ -1731,6 +2368,94 @@ mod tests {
             panic!("expected span");
         };
         assert_eq!(header.references.len(), 1);
+    }
+
+    #[test]
+    fn depth_limit_preserves_nested_span_ranges_without_empty_text_segments() {
+        fn collect_spans(segments: &[Segment], spans: &mut Vec<SourceSpan>) {
+            for segment in segments {
+                match segment {
+                    Segment::Text(text) => {
+                        assert_ne!(text.text, "");
+                        assert!(text.span.start < text.span.end);
+                    }
+                    Segment::Directive(directive) => {
+                        if let Directive::Span { segments, .. } = &directive.directive {
+                            spans.push(directive.span);
+                            collect_spans(segments, spans);
+                        }
+                    }
+                }
+            }
+        }
+
+        fn deepest_children(segments: &[Segment]) -> Option<&[Segment]> {
+            for segment in segments {
+                if let Segment::Directive(directive) = segment
+                    && let Directive::Span { segments, .. } = &directive.directive
+                {
+                    return Some(deepest_children(segments).unwrap_or(segments));
+                }
+            }
+            None
+        }
+
+        let source = format!("é{}{}", "<ps>".repeat(32), "</ps>".repeat(32));
+        let parsed = Parser::new().parse(&source);
+
+        assert_eq!(parsed.round_trip(), source);
+        assert_eq!(parsed.data_plane(), "é");
+        assert_eq!(parsed.diagnostics.len(), 1);
+        assert_eq!(parsed.diagnostics[0].code, DiagnosticCode::SyntaxInvalid);
+        assert_eq!(parsed.diagnostics[0].span, SourceSpan::new(130, 130));
+
+        let mut spans = Vec::new();
+        collect_spans(&parsed.segments, &mut spans);
+        let expected: Vec<_> = (0..32)
+            .map(|depth| SourceSpan::new(2 + depth * 4, source.len() - depth * 5))
+            .collect();
+        assert_eq!(spans, expected);
+        assert_eq!(deepest_children(&parsed.segments).unwrap(), []);
+    }
+
+    #[test]
+    fn depth_limit_does_not_change_shallow_or_nonempty_bailout_content() {
+        fn find_text(segments: &[Segment]) -> Option<&TextSegment> {
+            for segment in segments {
+                match segment {
+                    Segment::Text(text) if text.span == SourceSpan::new(130, 131) => {
+                        return Some(text);
+                    }
+                    Segment::Text(_) => {}
+                    Segment::Directive(directive) => {
+                        if let Directive::Span { segments, .. } = &directive.directive
+                            && let Some(text) = find_text(segments)
+                        {
+                            return Some(text);
+                        }
+                    }
+                }
+            }
+            None
+        }
+
+        let shallow = format!("é{}{}", "<ps>".repeat(31), "</ps>".repeat(31));
+        let parsed_shallow = Parser::new().parse(&shallow);
+        assert_eq!(parsed_shallow.round_trip(), shallow);
+        assert_eq!(parsed_shallow.data_plane(), "é");
+        assert_eq!(parsed_shallow.diagnostics, [] as [Diagnostic; 0]);
+
+        let source = format!("é{}x{}", "<ps>".repeat(32), "</ps>".repeat(32));
+        let parsed = Parser::new().parse(&source);
+        assert_eq!(parsed.round_trip(), source);
+        assert_eq!(parsed.data_plane(), "éx");
+        assert_eq!(parsed.diagnostics.len(), 1);
+        assert_eq!(parsed.diagnostics[0].code, DiagnosticCode::SyntaxInvalid);
+        assert_eq!(parsed.diagnostics[0].span, SourceSpan::new(130, 131));
+
+        let text = find_text(&parsed.segments).unwrap();
+        assert_eq!(text.text, "x");
+        assert_eq!(text.span, SourceSpan::new(130, 131));
     }
 
     #[test]
@@ -1822,6 +2547,176 @@ mod tests {
     }
 
     #[test]
+    fn incremental_authoring_releases_prose_and_bounds_ambiguous_lines() {
+        let parser = Parser::new().authoring_namespace("agency");
+        let mut prose = parser.authoring_stream();
+        let text = "ordinary prose ".repeat(8_000);
+        let out = prose.push(&text);
+        assert_eq!(out.data_plane, text);
+        assert!(prose.pending.is_empty());
+
+        let mut overflow = parser.authoring_stream();
+        let prefix = "\u{2003}".repeat(AUTHORING_STREAM_MAX_UNDECIDED_BYTES / 3);
+        let mut ambiguous = prefix;
+        ambiguous.push_str("<ps @agency:items.add(");
+        let first = overflow.push(&ambiguous);
+        assert!(first.data_plane.is_empty());
+        assert!(overflow.pending.len() <= AUTHORING_STREAM_MAX_UNDECIDED_BYTES);
+        assert!(overflow.overflow);
+        let remainder = "x".repeat(70_000);
+        let _ = overflow.push(&remainder);
+        let mut end = overflow.push("\nAfter");
+        end.append(overflow.finish());
+        assert_eq!(end.data_plane, "After");
+        assert_eq!(end.diagnostics.len(), 1);
+        assert_eq!(
+            end.diagnostics[0].span,
+            SourceSpan::new(0, ambiguous.len() + remainder.len())
+        );
+        assert!(end.diagnostics[0].message.contains("64 KiB"));
+    }
+
+    #[test]
+    fn incremental_authoring_releases_closed_undeclared_prefixes_before_long_tails() {
+        let parser = Parser::new().authoring_namespace("agency");
+        let tail = format!("{}\n", "x".repeat(64 * 1024));
+
+        for prefix in ["<ps @other>", "<ps@other("] {
+            let mut partitioned = parser.authoring_stream();
+            let first = partitioned.push(prefix);
+            assert_eq!(first.data_plane, prefix);
+            assert!(first.directives.is_empty());
+            assert!(first.diagnostics.is_empty());
+
+            let second = partitioned.push(&tail);
+            assert_eq!(second.data_plane, tail);
+            assert!(second.directives.is_empty());
+            assert!(second.diagnostics.is_empty());
+            assert!(partitioned.finish().data_plane.is_empty());
+
+            let source = format!("{prefix}{tail}");
+            let mut single_chunk = parser.authoring_stream();
+            let output = single_chunk.push(&source);
+            assert_eq!(output.data_plane, source);
+            assert!(output.directives.is_empty());
+            assert!(output.diagnostics.is_empty());
+
+            let split_points = [
+                0,
+                1,
+                prefix.len() - 1,
+                prefix.len(),
+                prefix.len() + 1,
+                source.len() / 2,
+                source.len() - 1,
+                source.len(),
+            ];
+            for split in split_points {
+                let mut stream = parser.authoring_stream();
+                let mut output = StreamOutput::default();
+                output.append(stream.push(&source[..split]));
+                output.append(stream.push(&source[split..]));
+                output.append(stream.finish());
+                assert_eq!(output.data_plane, source, "{prefix}, split {split}");
+                assert!(output.directives.is_empty());
+                assert!(output.diagnostics.is_empty());
+            }
+        }
+
+        for source in ["<ps @ag>\n", "<ps@ag(\n"] {
+            let mut stream = parser.authoring_stream();
+            let output = stream.push(source);
+            assert!(output.data_plane.is_empty());
+            assert_eq!(output.diagnostics.len(), 1);
+            assert_eq!(output.diagnostics[0].code, DiagnosticCode::SyntaxInvalid);
+            assert_eq!(
+                output.diagnostics[0].span,
+                SourceSpan::new(0, source.len() - 1)
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_authoring_keeps_quoted_tag_ends_and_unicode_separated_spaces() {
+        let parser = Parser::new().authoring_namespace("agency");
+        let undeclared = r#"<ps @other attr="a \" > b">"#;
+        let first_tag_end = undeclared.find('>').unwrap();
+        let mut stream = parser.authoring_stream();
+        let prefix = stream.push(&undeclared[..=first_tag_end]);
+        assert!(prefix.data_plane.is_empty());
+        let end = stream.push(&undeclared[first_tag_end + 1..]);
+        assert_eq!(end.data_plane, undeclared);
+        assert!(end.directives.is_empty());
+        assert!(end.diagnostics.is_empty());
+
+        let directive = r#"<ps @agency:items.add(ref: "t1")>"#;
+        let source = format!(" \u{2003}   {directive}\n");
+        for split in source
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain([source.len()])
+        {
+            let mut stream = parser.authoring_stream();
+            let mut output = StreamOutput::default();
+            output.append(stream.push(&source[..split]));
+            output.append(stream.push(&source[split..]));
+            output.append(stream.finish());
+            assert!(output.data_plane.is_empty(), "split {split}");
+            assert_eq!(output.directives.len(), 1, "split {split}");
+            assert_eq!(output.directives[0].source, directive);
+            assert_eq!(
+                output.directives[0].span,
+                SourceSpan::new(" \u{2003}   ".len(), " \u{2003}   ".len() + directive.len())
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_authoring_overflow_does_not_emit_lf_after_prose_transition() {
+        let parser = Parser::new().authoring_namespace("agency");
+        let source = format!(
+            "<ps @agency{}>\n",
+            "x".repeat(AUTHORING_STREAM_MAX_UNDECIDED_BYTES)
+        );
+
+        for split in [0, "<ps @agency".len(), source.len() - 1, source.len()] {
+            let mut stream = parser.authoring_stream();
+            let mut output = StreamOutput::default();
+            output.append(stream.push(&source[..split]));
+            output.append(stream.push(&source[split..]));
+            output.append(stream.finish());
+            assert!(output.data_plane.is_empty());
+            assert!(output.directives.is_empty());
+            assert_eq!(output.diagnostics.len(), 1);
+            assert_eq!(
+                output.diagnostics[0].span,
+                SourceSpan::new(0, source.len() - 1)
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_authoring_partitioning_preserves_absolute_offsets_after_suppression() {
+        let prefix = "Before é\n";
+        let directive = "<ps @agency:items.add(ref: \"t1\")>";
+        let source = format!("{prefix}{directive}\r\nAfter");
+        let parser = Parser::new().authoring_namespace("agency");
+        for split in source.char_indices().map(|(i, _)| i).chain([source.len()]) {
+            let mut stream = parser.authoring_stream();
+            let mut result = StreamOutput::default();
+            result.append(stream.push(&source[..split]));
+            result.append(stream.push(&source[split..]));
+            result.append(stream.finish());
+            assert_eq!(result.data_plane, "Before é\nAfter", "split {split}");
+            assert_eq!(result.directives.len(), 1, "split {split}");
+            assert_eq!(
+                result.directives[0].span,
+                SourceSpan::new(prefix.len(), prefix.len() + directive.len())
+            );
+        }
+    }
+
+    #[test]
     fn incremental_authoring_preserves_prose_and_absolute_spans() {
         let directive = r#"<ps @agency:items.state(id: "item-a", status: "active")>"#;
         let source = format!("Working.\n{directive}\nContinuing.");
@@ -1841,6 +2736,82 @@ mod tests {
     }
 
     #[test]
+    fn incremental_authoring_unicode_indentation_matches_complete_line() {
+        let directive = r#"<ps @agency:items.state(id: "item-a", status: "active")>"#;
+        let parser = Parser::new().authoring_namespace("agency");
+        let boundaries = |source: &str| {
+            source
+                .char_indices()
+                .map(|(index, _)| index)
+                .chain([source.len()])
+                .collect::<Vec<_>>()
+        };
+
+        // Each pair creates a synthetic three-chunk partition, including splits
+        // within the multibyte indentation and at the directive's boundaries.
+        for indentation in ["\u{00a0}", "\u{2003}\u{00a0}", " \u{2003}\t\u{00a0}"] {
+            let source = format!("{indentation}{directive}\nProse");
+            let points = boundaries(&source);
+            for &first in &points {
+                for &second in points.iter().filter(|&&point| point >= first) {
+                    let mut stream = parser.authoring_stream();
+                    let mut output = StreamOutput::default();
+                    output.append(stream.push(&source[..first]));
+                    output.append(stream.push(&source[first..second]));
+                    output.append(stream.push(&source[second..]));
+                    output.append(stream.finish());
+
+                    assert_eq!(output.data_plane, "Prose", "partition {first}, {second}");
+                    assert_eq!(output.directives.len(), 1, "partition {first}, {second}");
+                    assert_eq!(output.directives[0].source, directive);
+                    assert_eq!(
+                        output.directives[0].span,
+                        SourceSpan::new(indentation.len(), indentation.len() + directive.len())
+                    );
+                }
+            }
+        }
+
+        // The raw Markdown indentation gates remain inert, while Unicode-indented
+        // prose remains ordinary data and is preserved byte-for-byte.
+        for indentation in ["    ", "\t"] {
+            let source = format!("{indentation}{directive}\n");
+            let points = boundaries(&source);
+            for &first in &points {
+                for &second in points.iter().filter(|&&point| point >= first) {
+                    let mut stream = parser.authoring_stream();
+                    let mut output = StreamOutput::default();
+                    output.append(stream.push(&source[..first]));
+                    output.append(stream.push(&source[first..second]));
+                    output.append(stream.push(&source[second..]));
+                    output.append(stream.finish());
+
+                    assert_eq!(output.data_plane, source, "partition {first}, {second}");
+                    assert!(output.directives.is_empty());
+                    assert!(output.diagnostics.is_empty());
+                }
+            }
+        }
+
+        let prose = "\u{2003}\u{00a0}Plain prose\n";
+        let points = boundaries(prose);
+        for &first in &points {
+            for &second in points.iter().filter(|&&point| point >= first) {
+                let mut stream = parser.authoring_stream();
+                let mut output = StreamOutput::default();
+                output.append(stream.push(&prose[..first]));
+                output.append(stream.push(&prose[first..second]));
+                output.append(stream.push(&prose[second..]));
+                output.append(stream.finish());
+
+                assert_eq!(output.data_plane, prose, "partition {first}, {second}");
+                assert!(output.directives.is_empty());
+                assert!(output.diagnostics.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn incremental_authoring_keeps_quoted_and_code_content_inert() {
         let directive = r#"<ps @agency:items.state(id: "item-a", status: "active")>"#;
         let source = format!(
@@ -1856,8 +2827,8 @@ mod tests {
         output.append(stream.finish());
 
         assert_eq!(output.data_plane, source);
-        assert!(output.directives.is_empty());
-        assert!(output.diagnostics.is_empty());
+        assert_eq!(output.directives, [] as [DirectiveSegment; 0]);
+        assert_eq!(output.diagnostics, [] as [Diagnostic; 0]);
     }
 
     #[test]
@@ -1869,8 +2840,8 @@ mod tests {
         let first = stream.push(source);
         let last = stream.finish();
 
-        assert!(first.data_plane.is_empty());
-        assert!(last.data_plane.is_empty());
+        assert_eq!(first.data_plane, "");
+        assert_eq!(last.data_plane, "");
         assert_eq!(last.diagnostics.len(), 1);
         assert_eq!(last.diagnostics[0].code, DiagnosticCode::SyntaxInvalid);
         assert_eq!(last.diagnostics[0].span, SourceSpan::new(0, source.len()));
@@ -1886,8 +2857,8 @@ mod tests {
         output.append(stream.finish());
 
         assert_eq!(output.data_plane, source);
-        assert!(output.directives.is_empty());
-        assert!(output.diagnostics.is_empty());
+        assert_eq!(output.directives, [] as [DirectiveSegment; 0]);
+        assert_eq!(output.diagnostics, [] as [Diagnostic; 0]);
     }
 
     #[test]
