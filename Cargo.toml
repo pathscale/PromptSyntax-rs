@@ -1,6 +1,7 @@
 [package]
 name = "promptsyntax"
 version = "0.2.0"
+publish = ["crates-io"]
 edition = "2024"
 description = "A provenance-aware parser for Prompt Syntax"
 license = "MIT"
