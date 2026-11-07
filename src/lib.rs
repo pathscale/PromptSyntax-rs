@@ -460,7 +460,7 @@ impl Parser {
     #[must_use]
     pub fn parse(&self, source: &str) -> ParsedPrompt {
         let mut diagnostics = Vec::new();
-        let segments = self.parse_region(source, 0, &mut diagnostics, true);
+        let segments = self.parse_region(source, 0, &mut diagnostics, true, 0);
         ParsedPrompt {
             source: source.to_string(),
             segments,
@@ -474,7 +474,16 @@ impl Parser {
         base: usize,
         diagnostics: &mut Vec<Diagnostic>,
         document_start: bool,
+        depth: usize,
     ) -> Vec<Segment> {
+        if depth >= 32 {
+            diagnostics.push(Diagnostic {
+                code: DiagnosticCode::SyntaxInvalid,
+                message: "Prompt Syntax span depth exceeds 32".into(),
+                span: SourceSpan::new(base, base + source.len()),
+            });
+            return vec![text_segment(source, base, 0, source.len())];
+        }
         let mut segments = Vec::new();
         let mut cursor = 0;
         let mut text_start = 0;
@@ -553,7 +562,7 @@ impl Parser {
             }
 
             let parsed = if starts_ps {
-                self.parse_span(source, cursor, base, diagnostics)
+                self.parse_span(source, cursor, base, diagnostics, depth)
             } else if matches!(ch, '@' | '＠') && boundary_before(source, cursor) {
                 self.parse_reference_or_route(source, cursor, base, diagnostics)
             } else if matches!(ch, '/' | '／') && boundary_before(source, cursor) {
@@ -727,6 +736,7 @@ impl Parser {
         start: usize,
         base: usize,
         diagnostics: &mut Vec<Diagnostic>,
+        depth: usize,
     ) -> Option<(usize, Directive)> {
         let header_end = find_tag_end(source, start + 3)?;
         let header = &source[start + 3..header_end];
@@ -796,7 +806,7 @@ impl Parser {
                 attributes: Vec::new(),
             }
         });
-        let segments = self.parse_region(body, base + body_start, diagnostics, false);
+        let segments = self.parse_region(body, base + body_start, diagnostics, false, depth + 1);
         let end = close + "</ps>".len();
         Some((
             end,
