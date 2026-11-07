@@ -5,7 +5,7 @@
 //! messages, or model output unless a higher-authority promotion has made that content
 //! an authoring segment.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization as _;
@@ -494,6 +494,9 @@ impl Parser {
         if depth >= 32 {
             return Self::depth_limit_segments(source, base, diagnostics);
         }
+        // Keep the memo tables empty unless this region reaches a real span
+        // candidate after the parser's normal fence, URL, and markup skips.
+        let mut span_lookup = SpanLookup::default();
         let mut segments = Vec::new();
         let mut cursor = 0;
         let mut text_start = 0;
@@ -569,7 +572,7 @@ impl Parser {
             }
 
             let parsed = if starts_ps {
-                self.parse_span(source, cursor, base, diagnostics, depth)
+                self.parse_span(source, cursor, base, diagnostics, depth, &mut span_lookup)
             } else if matches!(ch, '@' | '＠') && boundary_before(source, cursor) {
                 self.parse_reference_or_route(source, cursor, base, diagnostics)
             } else if matches!(ch, '/' | '／') && boundary_before(source, cursor) {
@@ -591,7 +594,7 @@ impl Parser {
                 // A `<ps ...>` header that failed as a whole stays inert as a whole.
                 // Do not resume scanning inside it and accidentally promote one of its
                 // references as an independent point directive.
-                if starts_ps && let Some(end) = find_tag_end(source, cursor + 3) {
+                if starts_ps && let Some(end) = span_lookup.tag_end(source, cursor + 3) {
                     cursor = end + 1;
                     continue;
                 }
@@ -744,8 +747,9 @@ impl Parser {
         base: usize,
         diagnostics: &mut Vec<Diagnostic>,
         depth: usize,
+        span_lookup: &mut SpanLookup,
     ) -> Option<(usize, Directive)> {
-        let header_end = find_tag_end(source, start + 3)?;
+        let header_end = span_lookup.tag_end(source, start + 3)?;
         let header = &source[start + 3..header_end];
         if contains_bidi(header) {
             diagnostics.push(ParseFailure::bidi(start, header_end + 1).at(base));
@@ -762,7 +766,7 @@ impl Parser {
             return None;
         }
         let body_start = header_end + 1;
-        let Some(close) = find_span_close(source, body_start) else {
+        let Some(close) = span_lookup.close_for(source, body_start) else {
             if line_tail_is_empty(source, body_start) {
                 if let Ok(reference) = parse_reference(header.trim(), 0)
                     && reference.end == header.trim().len()
@@ -1385,6 +1389,121 @@ fn find_tag_end(source: &str, start: usize) -> Option<usize> {
     None
 }
 
+#[derive(Default)]
+struct SpanLookup {
+    tag_ends: HashMap<usize, Option<usize>>,
+    closes: HashMap<usize, Option<usize>>,
+}
+
+impl SpanLookup {
+    fn tag_end(&mut self, source: &str, start: usize) -> Option<usize> {
+        if let Some(result) = self.tag_ends.get(&start) {
+            return *result;
+        }
+        let result = find_tag_end(source, start);
+        if let Some(end) = result {
+            self.tag_ends.insert(start, Some(end));
+        } else {
+            self.memoize_tag_suffix(source, start);
+            self.tag_ends.insert(start, None);
+        }
+        result
+    }
+
+    // A failed quote-aware scan reaches EOF. Reuse a reverse automaton pass
+    // to memoize the answers only at possible `<ps` header offsets in that
+    // suffix, so later candidates do not each rescan the malformed tail.
+    fn memoize_tag_suffix(&mut self, source: &str, suffix_start: usize) {
+        let mut candidates = Vec::new();
+        for (relative, _) in source[suffix_start..].char_indices() {
+            let opener = suffix_start + relative;
+            if source[opener..].starts_with("<ps") && boundary_after_ps(source, opener) {
+                candidates.push(opener + 3);
+            }
+        }
+
+        let mut next = [None; 5];
+        for (relative, ch) in source[suffix_start..].char_indices().rev() {
+            let at = suffix_start + relative;
+            let mut current = [None; 5];
+            for (state, result) in current.iter_mut().enumerate() {
+                let next_state = match state {
+                    0 => match ch {
+                        '>' => {
+                            *result = Some(at);
+                            continue;
+                        }
+                        '\'' => 1,
+                        '"' => 2,
+                        _ => 0,
+                    },
+                    1 => match ch {
+                        '\\' => 3,
+                        '\'' => 0,
+                        _ => 1,
+                    },
+                    2 => match ch {
+                        '\\' => 4,
+                        '"' => 0,
+                        _ => 2,
+                    },
+                    3 => 1,
+                    4 => 2,
+                    _ => unreachable!(),
+                };
+                *result = next[next_state];
+            }
+            if candidates.last() == Some(&at) {
+                candidates.pop();
+                self.tag_ends.insert(at, current[0]);
+            }
+            next = current;
+        }
+    }
+
+    fn close_for(&mut self, source: &str, start: usize) -> Option<usize> {
+        if let Some(result) = self.closes.get(&start) {
+            return *result;
+        }
+
+        let mut pending = vec![start];
+        let mut cursor = start;
+        while cursor < source.len() {
+            if let Some(end) = fenced_block_end(source, cursor) {
+                cursor = end;
+                continue;
+            }
+            if source[cursor..].starts_with("<ps") && boundary_after_ps(source, cursor) {
+                let Some(end) = self.tag_end(source, cursor + 3) else {
+                    for body_start in pending.drain(..) {
+                        self.closes.insert(body_start, None);
+                    }
+                    return None;
+                };
+                let body_start = end + 1;
+                pending.push(body_start);
+                cursor = body_start;
+                continue;
+            }
+            if source[cursor..].starts_with("</ps>") {
+                let body_start = pending.pop()?;
+                self.closes.insert(body_start, Some(cursor));
+                if pending.is_empty() {
+                    return Some(cursor);
+                }
+                cursor += "</ps>".len();
+                continue;
+            }
+            cursor += source[cursor..].chars().next()?.len_utf8();
+        }
+
+        for body_start in pending {
+            self.closes.insert(body_start, None);
+        }
+        None
+    }
+}
+
 struct InertRegion {
     end: usize,
     closed: bool,
@@ -1516,33 +1635,6 @@ fn url_like_end(source: &str, start: usize) -> Option<usize> {
     Some(cursor)
 }
 
-fn find_span_close(source: &str, start: usize) -> Option<usize> {
-    let mut cursor = start;
-    let mut depth = 1usize;
-    while cursor < source.len() {
-        if let Some(end) = fenced_block_end(source, cursor) {
-            cursor = end;
-            continue;
-        }
-        if source[cursor..].starts_with("<ps") && boundary_after_ps(source, cursor) {
-            let end = find_tag_end(source, cursor + 3)?;
-            depth += 1;
-            cursor = end + 1;
-            continue;
-        }
-        if source[cursor..].starts_with("</ps>") {
-            depth -= 1;
-            if depth == 0 {
-                return Some(cursor);
-            }
-            cursor += "</ps>".len();
-            continue;
-        }
-        cursor += source[cursor..].chars().next()?.len_utf8();
-    }
-    None
-}
-
 fn boundary_after_ps(source: &str, start: usize) -> bool {
     source[start + 3..]
         .chars()
@@ -1551,10 +1643,10 @@ fn boundary_after_ps(source: &str, start: usize) -> bool {
 }
 
 fn line_tail_is_empty(source: &str, start: usize) -> bool {
-    let end = source[start..]
-        .find(['\r', '\n'])
-        .map_or(source.len(), |offset| start + offset);
-    source[start..end].trim().is_empty()
+    source[start..]
+        .chars()
+        .take_while(|ch| !matches!(ch, '\r' | '\n'))
+        .all(char::is_whitespace)
 }
 
 fn boundary_before(source: &str, start: usize) -> bool {
@@ -1631,6 +1723,41 @@ fn text_segment(source: &str, base: usize, start: usize, end: usize) -> Segment 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comment_opener_with_quote_does_not_hide_following_span() {
+        let source = "<!-- <ps \" -->\n<ps>body</ps>\n\">";
+        let parsed = Parser::new().parse(source);
+        let span_start = source.rfind("<ps>").unwrap();
+        let span_end = span_start + "<ps>body</ps>".len();
+        assert_eq!(parsed.round_trip(), source);
+        assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
+        assert_eq!(parsed.directives().count(), 1);
+        assert_eq!(
+            parsed.segments.iter().find_map(|segment| match segment {
+                Segment::Directive(directive) => Some(directive.span),
+                Segment::Text(_) => None,
+            }),
+            Some(SourceSpan::new(span_start, span_end))
+        );
+    }
+
+    #[test]
+    fn malformed_quoted_header_keeps_later_candidate_recovery() {
+        let source = "<ps title=\"broken <ps>inner</ps>";
+        let parsed = Parser::new().parse(source);
+        let inner_start = source.find("<ps>").unwrap();
+        assert_eq!(parsed.round_trip(), source);
+        assert_eq!(parsed.diagnostics, Vec::<Diagnostic>::new());
+        assert_eq!(parsed.directives().count(), 1);
+        assert_eq!(
+            parsed.segments.iter().find_map(|segment| match segment {
+                Segment::Directive(directive) => Some(directive.span),
+                Segment::Text(_) => None,
+            }),
+            Some(SourceSpan::new(inner_start, source.len()))
+        );
+    }
 
     #[test]
     fn separates_control_and_data_planes_losslessly() {
