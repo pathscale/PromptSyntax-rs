@@ -468,6 +468,21 @@ impl Parser {
         }
     }
 
+    fn depth_limit_segments(
+        source: &str,
+        base: usize,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Vec<Segment> {
+        diagnostics.push(Diagnostic {
+            code: DiagnosticCode::SyntaxInvalid,
+            message: "Prompt Syntax span depth exceeds 32".into(),
+            span: SourceSpan::new(base, base + source.len()),
+        });
+        let mut segments = Vec::new();
+        push_text(source, base, 0, source.len(), &mut segments);
+        segments
+    }
+
     fn parse_region(
         &self,
         source: &str,
@@ -477,12 +492,7 @@ impl Parser {
         depth: usize,
     ) -> Vec<Segment> {
         if depth >= 32 {
-            diagnostics.push(Diagnostic {
-                code: DiagnosticCode::SyntaxInvalid,
-                message: "Prompt Syntax span depth exceeds 32".into(),
-                span: SourceSpan::new(base, base + source.len()),
-            });
-            return vec![text_segment(source, base, 0, source.len())];
+            return Self::depth_limit_segments(source, base, diagnostics);
         }
         let mut segments = Vec::new();
         let mut cursor = 0;
@@ -515,12 +525,9 @@ impl Parser {
         }
 
         while cursor < source.len() {
-            if let Some(end) = fenced_block_end(source, cursor) {
-                cursor = end;
-                continue;
-            }
-
-            if let Some(end) = url_like_end(source, cursor) {
+            if let Some(end) =
+                fenced_block_end(source, cursor).or_else(|| url_like_end(source, cursor))
+            {
                 cursor = end;
                 continue;
             }
@@ -1632,7 +1639,7 @@ mod tests {
         assert_eq!(parsed.round_trip(), source);
         assert_eq!(parsed.data_plane(), " Summarize  ");
         assert_eq!(parsed.directives().count(), 3);
-        assert!(parsed.diagnostics.is_empty());
+        assert_eq!(parsed.diagnostics, [] as [Diagnostic; 0]);
     }
 
     #[test]
@@ -1649,7 +1656,7 @@ mod tests {
         let parsed = Parser::new().parse(source);
         assert_eq!(parsed.data_plane(), source);
         assert_eq!(parsed.directives().count(), 0);
-        assert!(parsed.diagnostics.is_empty());
+        assert_eq!(parsed.diagnostics, [] as [Diagnostic; 0]);
     }
 
     #[test]
@@ -1661,7 +1668,7 @@ mod tests {
             "for a<b the value  matters if x > y end"
         );
         assert_eq!(parsed.directives().count(), 1);
-        assert!(parsed.diagnostics.is_empty());
+        assert_eq!(parsed.diagnostics, [] as [Diagnostic; 0]);
     }
 
     #[test]
@@ -1683,7 +1690,7 @@ mod tests {
             "note://host/@model:atlas/atlas-4 then "
         );
         assert_eq!(parsed.directives().count(), 1);
-        assert!(parsed.diagnostics.is_empty());
+        assert_eq!(parsed.diagnostics, [] as [Diagnostic; 0]);
     }
 
     #[test]
@@ -1741,6 +1748,94 @@ mod tests {
             panic!("expected span");
         };
         assert_eq!(header.references.len(), 1);
+    }
+
+    #[test]
+    fn depth_limit_preserves_nested_span_ranges_without_empty_text_segments() {
+        fn collect_spans(segments: &[Segment], spans: &mut Vec<SourceSpan>) {
+            for segment in segments {
+                match segment {
+                    Segment::Text(text) => {
+                        assert_ne!(text.text, "");
+                        assert!(text.span.start < text.span.end);
+                    }
+                    Segment::Directive(directive) => {
+                        if let Directive::Span { segments, .. } = &directive.directive {
+                            spans.push(directive.span);
+                            collect_spans(segments, spans);
+                        }
+                    }
+                }
+            }
+        }
+
+        fn deepest_children(segments: &[Segment]) -> Option<&[Segment]> {
+            for segment in segments {
+                if let Segment::Directive(directive) = segment
+                    && let Directive::Span { segments, .. } = &directive.directive
+                {
+                    return Some(deepest_children(segments).unwrap_or(segments));
+                }
+            }
+            None
+        }
+
+        let source = format!("é{}{}", "<ps>".repeat(32), "</ps>".repeat(32));
+        let parsed = Parser::new().parse(&source);
+
+        assert_eq!(parsed.round_trip(), source);
+        assert_eq!(parsed.data_plane(), "é");
+        assert_eq!(parsed.diagnostics.len(), 1);
+        assert_eq!(parsed.diagnostics[0].code, DiagnosticCode::SyntaxInvalid);
+        assert_eq!(parsed.diagnostics[0].span, SourceSpan::new(130, 130));
+
+        let mut spans = Vec::new();
+        collect_spans(&parsed.segments, &mut spans);
+        let expected: Vec<_> = (0..32)
+            .map(|depth| SourceSpan::new(2 + depth * 4, source.len() - depth * 5))
+            .collect();
+        assert_eq!(spans, expected);
+        assert_eq!(deepest_children(&parsed.segments).unwrap(), []);
+    }
+
+    #[test]
+    fn depth_limit_does_not_change_shallow_or_nonempty_bailout_content() {
+        fn find_text(segments: &[Segment]) -> Option<&TextSegment> {
+            for segment in segments {
+                match segment {
+                    Segment::Text(text) if text.span == SourceSpan::new(130, 131) => {
+                        return Some(text);
+                    }
+                    Segment::Text(_) => {}
+                    Segment::Directive(directive) => {
+                        if let Directive::Span { segments, .. } = &directive.directive
+                            && let Some(text) = find_text(segments)
+                        {
+                            return Some(text);
+                        }
+                    }
+                }
+            }
+            None
+        }
+
+        let shallow = format!("é{}{}", "<ps>".repeat(31), "</ps>".repeat(31));
+        let parsed_shallow = Parser::new().parse(&shallow);
+        assert_eq!(parsed_shallow.round_trip(), shallow);
+        assert_eq!(parsed_shallow.data_plane(), "é");
+        assert_eq!(parsed_shallow.diagnostics, [] as [Diagnostic; 0]);
+
+        let source = format!("é{}x{}", "<ps>".repeat(32), "</ps>".repeat(32));
+        let parsed = Parser::new().parse(&source);
+        assert_eq!(parsed.round_trip(), source);
+        assert_eq!(parsed.data_plane(), "éx");
+        assert_eq!(parsed.diagnostics.len(), 1);
+        assert_eq!(parsed.diagnostics[0].code, DiagnosticCode::SyntaxInvalid);
+        assert_eq!(parsed.diagnostics[0].span, SourceSpan::new(130, 131));
+
+        let text = find_text(&parsed.segments).unwrap();
+        assert_eq!(text.text, "x");
+        assert_eq!(text.span, SourceSpan::new(130, 131));
     }
 
     #[test]
@@ -1866,8 +1961,8 @@ mod tests {
         output.append(stream.finish());
 
         assert_eq!(output.data_plane, source);
-        assert!(output.directives.is_empty());
-        assert!(output.diagnostics.is_empty());
+        assert_eq!(output.directives, [] as [DirectiveSegment; 0]);
+        assert_eq!(output.diagnostics, [] as [Diagnostic; 0]);
     }
 
     #[test]
@@ -1879,8 +1974,8 @@ mod tests {
         let first = stream.push(source);
         let last = stream.finish();
 
-        assert!(first.data_plane.is_empty());
-        assert!(last.data_plane.is_empty());
+        assert_eq!(first.data_plane, "");
+        assert_eq!(last.data_plane, "");
         assert_eq!(last.diagnostics.len(), 1);
         assert_eq!(last.diagnostics[0].code, DiagnosticCode::SyntaxInvalid);
         assert_eq!(last.diagnostics[0].span, SourceSpan::new(0, source.len()));
@@ -1896,8 +1991,8 @@ mod tests {
         output.append(stream.finish());
 
         assert_eq!(output.data_plane, source);
-        assert!(output.directives.is_empty());
-        assert!(output.diagnostics.is_empty());
+        assert_eq!(output.directives, [] as [DirectiveSegment; 0]);
+        assert_eq!(output.diagnostics, [] as [Diagnostic; 0]);
     }
 
     #[test]
