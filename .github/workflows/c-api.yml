@@ -25,6 +25,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install stable Rust with lint components
         uses: dtolnay/rust-toolchain@stable
